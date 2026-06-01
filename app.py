@@ -174,6 +174,7 @@ async def llamada(
     db: Session = Depends(get_db)
 ):
     print(f"Llamada recibida de: {From}")
+    telefono_url = From.replace("+", "%2B")
 
     cita = (
         db.query(Cita)
@@ -188,10 +189,11 @@ async def llamada(
 
     <Gather
         input="speech"
-        language="es-MX"
-        action="/procesar-cita"
-        method="POST"
-        timeout="5">
+    language="es-MX"
+    action="/procesar-cita?telefono={telefono_url}"
+    method="POST"
+    timeout="8"
+    speechTimeout="auto">
 
         <Say language="es-MX">
             Encontré una cita agendada para usted.
@@ -206,7 +208,9 @@ async def llamada(
         </Say>
 
     </Gather>
-
+<Say language="es-MX">
+        No recibí ninguna respuesta. Intente nuevamente.
+    </Say>
 </Response>
 """
     else:
@@ -216,7 +220,7 @@ async def llamada(
     <Gather
         input="speech"
         language="es-MX"
-        action="/procesar-agenda"
+        action="/procesar-agenda?telefono={telefono_url}"
         method="POST"
         timeout="5">
 
@@ -241,19 +245,42 @@ async def llamada(
 
 @app.post("/procesar-cita")
 async def procesar_cita(
-    SpeechResult: str = Form("")
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
 ):
-    respuesta = SpeechResult.lower()
+    print("ENTRO A PROCESAR_CITA")
+    
+    respuesta = SpeechResult.lower().strip()
 
+    print(f"Teléfono: {telefono}")
     print(f"Respuesta usuario: {respuesta}")
 
-    if "cancelar" in respuesta:
-        mensaje = "Perfecto. Iniciaremos la cancelación de su cita."
+    cita = (
+        db.query(Cita)
+        .filter(Cita.telefono == telefono)
+        .filter(Cita.status == "AGENDADA")
+        .first()
+    )
+
+    if not cita:
+        mensaje = "No encontré ninguna cita activa."
+
+    elif "cancelar" in respuesta:
+
+        cita.status = "CANCELADA"
+
+        db.commit()
+        db.refresh(cita)
+
+        mensaje = "Su cita ha sido cancelada correctamente."
 
     elif "reprogramar" in respuesta:
-        mensaje = "Perfecto. Iniciaremos la reprogramación de su cita."
+
+        mensaje = "Perfecto. Próximamente iniciaremos la reprogramación."
 
     else:
+
         mensaje = "No entendí su respuesta."
 
     twiml = f"""
@@ -270,10 +297,13 @@ async def procesar_cita(
     )
 @app.post("/procesar-agenda")
 async def procesar_agenda(
-    SpeechResult: str = Form("")
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
 ):
-    respuesta = SpeechResult.lower()
+    respuesta = SpeechResult.lower().strip()
 
+    print(f"Teléfono: {telefono}")
     print(f"Respuesta usuario: {respuesta}")
 
     if "agendar" in respuesta:
