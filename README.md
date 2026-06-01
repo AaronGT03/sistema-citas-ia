@@ -40,5 +40,4 @@ Aaron Galarza
 
 ## Autor
 
-Ivan Montelongo
- 
+Ivan Montelongo Jimenez
