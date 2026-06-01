@@ -37,5 +37,8 @@ uvicorn app:app --reload
 
 Aaron Galarza
 
-## Última prueba de GitHub
-Commit realizado correctamente.
+
+## Autor
+
+Ivan Montelongo
+ 
