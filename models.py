@@ -12,3 +12,14 @@ class Cita(Base):
     hora = Column(String, nullable=False)
     status = Column(String, nullable=False, default="AGENDADA")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Conversacion(Base):
+    __tablename__ = "conversaciones"
+
+    id = Column(Integer, primary_key=True, index=True)
+    telefono = Column(String, unique=True, index=True)
+    paso = Column(String, nullable=False)
+    nombre = Column(String, nullable=True)
+    fecha = Column(String, nullable=True)
+    hora = Column(String, nullable=True)

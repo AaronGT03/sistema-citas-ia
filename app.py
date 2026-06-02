@@ -5,7 +5,7 @@ from fastapi.responses import Response
 
 
 from database import engine, SessionLocal
-from models import Base, Cita
+from models import Base, Cita, Conversacion
 
 Base.metadata.create_all(bind=engine)
 
@@ -214,7 +214,7 @@ async def llamada(
 </Response>
 """
     else:
-        twiml = """
+        twiml = f"""
 <Response>
 
     <Gather
@@ -222,7 +222,8 @@ async def llamada(
         language="es-MX"
         action="/procesar-agenda?telefono={telefono_url}"
         method="POST"
-        timeout="5">
+        timeout="8"
+        speechTimeout="auto">
 
         <Say language="es-MX">
             No encontré ninguna cita activa.
@@ -249,8 +250,14 @@ async def procesar_cita(
     SpeechResult: str = Form(""),
     db: Session = Depends(get_db)
 ):
+
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+
     print("ENTRO A PROCESAR_CITA")
-    
+    print(f"SpeechResult RAW: [{SpeechResult}]")
+
     respuesta = SpeechResult.lower().strip()
 
     print(f"Teléfono: {telefono}")
@@ -301,22 +308,268 @@ async def procesar_agenda(
     SpeechResult: str = Form(""),
     db: Session = Depends(get_db)
 ):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    print("ENTRO A PROCESAR_AGENDA")
+    print(f"SpeechResult RAW: [{SpeechResult}]")
+
     respuesta = SpeechResult.lower().strip()
 
     print(f"Teléfono: {telefono}")
     print(f"Respuesta usuario: {respuesta}")
 
-    if "agendar" in respuesta:
-        mensaje = "Perfecto. Vamos a crear una nueva cita."
+    # resto del código...
 
-    else:
-        mensaje = "No entendí su respuesta."
+    if "agendar" in respuesta or "agenda" in respuesta or "agéndar" in respuesta or "en" in respuesta:
+
+        conversacion_existente = (
+            db.query(Conversacion)
+            .filter(Conversacion.telefono == telefono)
+            .first()
+        )
+
+        if conversacion_existente:
+            db.delete(conversacion_existente)
+            db.commit()
+
+        nueva_conversacion = Conversacion(
+            telefono=telefono,
+            paso="PEDIR_NOMBRE"
+        )
+
+        db.add(nueva_conversacion)
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-nombre?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto. ¿Cuál es su nombre completo?
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí su nombre. Intente nuevamente.
+    </Say>
+</Response>
+"""
+
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
+    twiml = """
+<Response>
+    <Say language="es-MX">
+        No entendí su respuesta.
+    </Say>
+</Response>
+"""
+
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
+@app.post("/guardar-nombre")
+async def guardar_nombre(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    nombre = SpeechResult.strip()
+
+    print("ENTRO A GUARDAR_NOMBRE")
+    print(f"Teléfono: {telefono}")
+    print(f"Nombre recibido: {nombre}")
+
+    conversacion = (
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
+    )
+
+    print(f"Conversacion encontrada: {conversacion}")
+
+    if not conversacion:
+        twiml = """
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+"""
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
+    conversacion.nombre = nombre
+    conversacion.paso = "PEDIR_FECHA"
+
+    db.commit()
 
     twiml = f"""
 <Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Gracias {nombre}. ¿Qué fecha desea para su cita?
+        </Say>
+
+    </Gather>
+
     <Say language="es-MX">
-        {mensaje}
+        No recibí la fecha. Intente nuevamente.
     </Say>
+</Response>
+"""
+
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
+@app.post("/guardar-fecha")
+async def guardar_fecha(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    fecha = SpeechResult.strip()
+
+    print("ENTRO A GUARDAR_FECHA")
+    print(f"Fecha recibida: {fecha}")
+
+    conversacion = (
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    conversacion.fecha = fecha
+    conversacion.paso = "PEDIR_HORA"
+
+    db.commit()
+
+    twiml = f"""
+<Response>
+
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-hora?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto. ¿A qué hora desea la cita?
+        </Say>
+
+    </Gather>
+
+</Response>
+"""
+
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
+@app.post("/guardar-hora")
+async def guardar_hora(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    hora = SpeechResult.strip()
+
+    print("ENTRO A GUARDAR_HORA")
+    print(f"Hora recibida: {hora}")
+
+    conversacion = (
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    conversacion.hora = hora
+
+    nueva_cita = Cita(
+        nombre=conversacion.nombre,
+        telefono=telefono,
+        fecha=conversacion.fecha,
+        hora=hora,
+        status="AGENDADA"
+    )
+
+    db.add(nueva_cita)
+
+    db.delete(conversacion)
+
+    db.commit()
+
+    twiml = f"""
+<Response>
+
+    <Say language="es-MX">
+        Perfecto {conversacion.nombre}.
+        Su cita fue agendada para el día
+        {conversacion.fecha}
+        a las
+        {hora}.
+    </Say>
+
 </Response>
 """
 
