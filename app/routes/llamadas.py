@@ -3,19 +3,45 @@ from sqlalchemy.orm import Session
 from fastapi.responses import Response
 
 from app.database import get_db
-from app.models import Cita, Conversacion
+from app.models import Cita, Conversacion, Empresa
 from app.utils.normalizador import normalizar_fecha, normalizar_hora
+
 
 router = APIRouter()
 
+
 @router.post("/llamada")
-async def llamada(From: str = Form(...), db: Session = Depends(get_db)):
+async def llamada(
+    From: str = Form(...), To: str = Form(...), db: Session = Depends(get_db)
+):
     print(f"Llamada recibida de: {From}")
-    telefono_url = From.replace("+", "%2B")
+    print(f"Número Twilio recibido: {To}")
+
+    telefono_cliente = From.replace(" ", "")
+    telefono_empresa = To.replace(" ", "")
+
+    telefono_url = telefono_cliente.replace("+", "%2B")
+
+    empresa = (
+        db.query(Empresa).filter(Empresa.telefono_twilio == telefono_empresa).first()
+    )
+
+    if not empresa:
+        twiml = """
+<Response>
+    <Say language="es-MX">
+        Este número no tiene una empresa configurada.
+    </Say>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    print(f"Empresa encontrada: {empresa.nombre}")
 
     cita = (
         db.query(Cita)
-        .filter(Cita.telefono == From)
+        .filter(Cita.telefono == telefono_cliente)
+        .filter(Cita.empresa_id == empresa.id)
         .filter(Cita.status == "AGENDADA")
         .first()
     )
@@ -23,20 +49,16 @@ async def llamada(From: str = Form(...), db: Session = Depends(get_db)):
     if cita:
         twiml = f"""
 <Response>
-
     <Gather
         input="speech"
-    language="es-MX"
-    action="/procesar-cita?telefono={telefono_url}"
-    method="POST"
-    timeout="8"
-    speechTimeout="auto">
-        <Say language="es-MX">
-            Hola {cita.nombre}.
-        </Say>
+        language="es-MX"
+        action="/procesar-cita?telefono={telefono_url}&amp;empresa_id={empresa.id}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
 
         <Say language="es-MX">
-            Encontré una cita agendada para usted.
+            Hola {cita.nombre}. Encontré una cita agendada para usted en {empresa.nombre}.
         </Say>
 
         <Say language="es-MX">
@@ -46,9 +68,9 @@ async def llamada(From: str = Form(...), db: Session = Depends(get_db)):
         <Say language="es-MX">
             Diga cancelar o reprogramar.
         </Say>
-
     </Gather>
-<Say language="es-MX">
+
+    <Say language="es-MX">
         No recibí ninguna respuesta. Intente nuevamente.
     </Say>
 </Response>
@@ -56,17 +78,16 @@ async def llamada(From: str = Form(...), db: Session = Depends(get_db)):
     else:
         twiml = f"""
 <Response>
-
     <Gather
         input="speech"
         language="es-MX"
-        action="/procesar-agenda?telefono={telefono_url}"
+        action="/procesar-agenda?telefono={telefono_url}&amp;empresa_id={empresa.id}"
         method="POST"
         timeout="8"
         speechTimeout="auto">
 
         <Say language="es-MX">
-            HOLA BIENVENIDO AL SISTEMA DE CITAS AUTOMÁTICO.
+            Hola, bienvenido a {empresa.nombre}.
         </Say>
 
         <Say language="es-MX">
@@ -74,12 +95,9 @@ async def llamada(From: str = Form(...), db: Session = Depends(get_db)):
         </Say>
 
         <Say language="es-MX">
-            Si desea agendar una cita diga:
-            agendar.
+            Si desea agendar una cita diga agendar.
         </Say>
-
     </Gather>
-
 </Response>
 """
 
@@ -139,20 +157,23 @@ async def procesar_cita(
 
 @router.post("/procesar-agenda")
 async def procesar_agenda(
-    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
+    telefono: str,
+    empresa_id: int,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db),
 ):
     telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
     telefono = telefono if telefono.startswith("+") else "+" + telefono
 
     print("ENTRO A PROCESAR_AGENDA")
     print(f"SpeechResult RAW: [{SpeechResult}]")
+    print(f"Empresa ID: {empresa_id}")
 
     respuesta = SpeechResult.lower().strip()
 
     print(f"Teléfono: {telefono}")
     print(f"Respuesta usuario: {respuesta}")
-
-    # resto del código...
 
     if (
         "agendar" in respuesta
@@ -168,7 +189,9 @@ async def procesar_agenda(
             db.delete(conversacion_existente)
             db.commit()
 
-        nueva_conversacion = Conversacion(telefono=telefono, paso="PEDIR_NOMBRE")
+        nueva_conversacion = Conversacion(
+            telefono=telefono, empresa_id=empresa_id, paso="PEDIR_NOMBRE"
+        )
 
         db.add(nueva_conversacion)
         db.commit()
@@ -324,11 +347,10 @@ async def guardar_fecha(
 
     return Response(content=twiml, media_type="application/xml")
 
+
 @router.post("/guardar-hora")
 async def guardar_hora(
-    telefono: str,
-    SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -340,9 +362,7 @@ async def guardar_hora(
     print(f"Hora recibida: {hora}")
 
     conversacion = (
-        db.query(Conversacion)
-        .filter(Conversacion.telefono == telefono)
-        .first()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
 
     if not conversacion:
@@ -354,7 +374,7 @@ async def guardar_hora(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
     conversacion.hora = hora
@@ -364,7 +384,8 @@ async def guardar_hora(
         telefono=telefono,
         fecha=conversacion.fecha,
         hora=hora,
-        status="AGENDADA"
+        status="AGENDADA",
+        empresa_id=conversacion.empresa_id,
     )
 
     db.add(nueva_cita)
@@ -387,7 +408,4 @@ async def guardar_hora(
 </Response>
 """
 
-    return Response(
-        content=twiml,
-        media_type="application/xml"
-    )
+    return Response(content=twiml, media_type="application/xml")
