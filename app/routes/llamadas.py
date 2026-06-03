@@ -106,14 +106,18 @@ async def llamada(
 
 @router.post("/procesar-cita")
 async def procesar_cita(
-    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
+    telefono: str,
+    empresa_id: int,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
 ):
-
     telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
     telefono = telefono if telefono.startswith("+") else "+" + telefono
 
     print("ENTRO A PROCESAR_CITA")
     print(f"SpeechResult RAW: [{SpeechResult}]")
+    print(f"Empresa ID: {empresa_id}")
 
     respuesta = SpeechResult.lower().strip()
 
@@ -123,6 +127,7 @@ async def procesar_cita(
     cita = (
         db.query(Cita)
         .filter(Cita.telefono == telefono)
+        .filter(Cita.empresa_id == empresa_id)
         .filter(Cita.status == "AGENDADA")
         .first()
     )
@@ -136,7 +141,7 @@ async def procesar_cita(
         db.commit()
         db.refresh(cita)
 
-        mensaje = "Su cita ha sido cancelada correctamente."
+        mensaje = "Su cita ha sido cancelada correctamente. Para poder realizar otra cita, llama nuevamente"
 
     elif "reprogramar" in respuesta:
         mensaje = "Perfecto. Próximamente iniciaremos la reprogramación."
@@ -152,7 +157,10 @@ async def procesar_cita(
 </Response>
 """
 
-    return Response(content=twiml, media_type="application/xml")
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
 
 
 @router.post("/procesar-agenda")
