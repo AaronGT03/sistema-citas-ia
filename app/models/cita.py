@@ -1,6 +1,7 @@
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, ForeignKey, Integer, String, DateTime
 from datetime import datetime
 from app.database import Base
+
 
 class Cita(Base):
     __tablename__ = "citas"
@@ -12,3 +13,4 @@ class Cita(Base):
     hora = Column(String)
     status = Column(String, default="AGENDADA")
     created_at = Column(DateTime, default=datetime.utcnow)
+    empresa_id = Column(Integer, ForeignKey("empresas.id"))
