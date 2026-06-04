@@ -6,7 +6,6 @@ from app.database import get_db
 from app.models import Cita, Conversacion, Empresa
 from app.utils.normalizador import normalizar_fecha, normalizar_hora
 
-
 router = APIRouter()
 
 
@@ -109,20 +108,15 @@ async def procesar_cita(
     telefono: str,
     empresa_id: int,
     SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
     telefono = telefono if telefono.startswith("+") else "+" + telefono
 
-    print("ENTRO A PROCESAR_CITA")
-    print(f"SpeechResult RAW: [{SpeechResult}]")
-    print(f"Empresa ID: {empresa_id}")
-
     respuesta = SpeechResult.lower().strip()
-
-    print(f"Teléfono: {telefono}")
-    print(f"Respuesta usuario: {respuesta}")
+    print("RESPUESTA DETECTADA:")
+    print(respuesta)
 
     cita = (
         db.query(Cita)
@@ -133,35 +127,94 @@ async def procesar_cita(
     )
 
     if not cita:
-        mensaje = "No encontré ninguna cita activa."
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré ninguna cita activa.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
 
-    elif "cancelar" in respuesta:
+    if "cancel" in respuesta:
+
         cita.status = "CANCELADA"
 
         db.commit()
-        db.refresh(cita)
 
-        mensaje = "Su cita ha sido cancelada correctamente. Para poder realizar otra cita, llama nuevamente"
-
-    elif "reprogramar" in respuesta:
-        mensaje = "Perfecto. Próximamente iniciaremos la reprogramación."
-
-    else:
-        mensaje = "No entendí su respuesta."
-
-    twiml = f"""
+        twiml = """
 <Response>
     <Say language="es-MX">
-        {mensaje}
+        Su cita ha sido cancelada correctamente.
+        Si desea agendar una nueva cita, por favor vuelva a llamar.
     </Say>
 </Response>
 """
 
-    return Response(
-        content=twiml,
-        media_type="application/xml"
-    )
+        print("=== CANCELACION ===")
+        print(twiml)
 
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
+    elif "reprogramar" in respuesta:
+
+        conversacion_existente = (
+            db.query(Conversacion)
+            .filter(Conversacion.telefono == telefono)
+            .first()
+        )
+
+        if conversacion_existente:
+            db.delete(conversacion_existente)
+            db.commit()
+
+        nueva_conversacion = Conversacion(
+            telefono=telefono,
+            empresa_id=empresa_id,
+            paso="REPROGRAMAR_FECHA"
+        )
+
+        db.add(nueva_conversacion)
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
+    return Response(
+        content="""
+<Response>
+    <Say language="es-MX">
+        No entendí su respuesta.
+    </Say>
+</Response>
+""",
+        media_type="application/xml",
+    )
 
 @router.post("/procesar-agenda")
 async def procesar_agenda(
@@ -301,7 +354,9 @@ async def guardar_nombre(
 
 @router.post("/guardar-fecha")
 async def guardar_fecha(
-    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -309,11 +364,37 @@ async def guardar_fecha(
 
     fecha = normalizar_fecha(SpeechResult.strip())
 
+    if fecha is None:
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
     print("ENTRO A GUARDAR_FECHA")
     print(f"Fecha recibida: {fecha}")
 
     conversacion = (
-        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
     )
 
     if not conversacion:
@@ -335,7 +416,6 @@ async def guardar_fecha(
 
     twiml = f"""
 <Response>
-
     <Gather
         input="speech"
         language="es-MX"
@@ -349,16 +429,20 @@ async def guardar_fecha(
         </Say>
 
     </Gather>
-
 </Response>
 """
 
-    return Response(content=twiml, media_type="application/xml")
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
 
 
 @router.post("/guardar-hora")
 async def guardar_hora(
-    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -366,11 +450,95 @@ async def guardar_hora(
 
     hora = normalizar_hora(SpeechResult.strip())
 
+    if hora == "AMBIGUA":
+        conversacion = (
+            db.query(Conversacion)
+            .filter(Conversacion.telefono == telefono)
+            .first()
+        )
+
+        if not conversacion:
+            return Response(
+                content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+                media_type="application/xml",
+            )
+
+        conversacion.hora = SpeechResult.strip()
+        conversacion.paso = "ACLARAR_HORA"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/aclarar-hora?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            ¿Se refiere a las {SpeechResult} de la mañana o de la tarde?
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí la aclaración. Intente nuevamente.
+    </Say>
+</Response>
+"""
+
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
+    if hora is None:
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-hora?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            No entendí la hora.
+        </Say>
+
+        <Say language="es-MX">
+            Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí ninguna respuesta. Intente nuevamente.
+    </Say>
+</Response>
+"""
+
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
     print("ENTRO A GUARDAR_HORA")
     print(f"Hora recibida: {hora}")
 
     conversacion = (
-        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
     )
 
     if not conversacion:
@@ -393,7 +561,87 @@ async def guardar_hora(
         fecha=conversacion.fecha,
         hora=hora,
         status="AGENDADA",
-        empresa_id=conversacion.empresa_id,
+        empresa_id=conversacion.empresa_id
+    )
+
+    db.add(nueva_cita)
+    db.delete(conversacion)
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Say language="es-MX">
+        Perfecto {conversacion.nombre}.
+        Su cita fue agendada para el día {conversacion.fecha}
+        a las {hora} horas.
+        Gracias por usar nuestro sistema de citas.
+    </Say>
+</Response>
+"""
+
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
+
+@router.post("/aclarar-hora")
+async def aclarar_hora(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    respuesta = SpeechResult.lower().strip()
+
+    conversacion = (
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    hora_original = conversacion.hora
+
+    try:
+        numero = int("".join(filter(str.isdigit, hora_original)))
+    except:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No pude identificar la hora.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    if "tarde" in respuesta or "noche" in respuesta:
+        hora_final = f"{numero + 12:02d}:00"
+    else:
+        hora_final = f"{numero:02d}:00"
+
+    nueva_cita = Cita(
+        nombre=conversacion.nombre,
+        telefono=telefono,
+        fecha=conversacion.fecha,
+        hora=hora_final,
+        status="AGENDADA",
+        empresa_id=conversacion.empresa_id
     )
 
     db.add(nueva_cita)
@@ -404,16 +652,365 @@ async def guardar_hora(
 
     twiml = f"""
 <Response>
+    <Say language="es-MX">
+        Perfecto.
+        Su cita fue agendada para el día
+        {nueva_cita.fecha}
+        a las
+        {hora_final} horas.
+    </Say>
+</Response>
+"""
+
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
+
+@router.post("/reprogramar-fecha")
+async def reprogramar_fecha(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    fecha = normalizar_fecha(SpeechResult.strip())
+
+    if fecha is None:
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+
+        return Response(
+            content=twiml,
+            media_type="application/xml"
+        )
+
+    conversacion = (
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    conversacion.fecha = fecha
+    conversacion.paso = "REPROGRAMAR_HORA"
+
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-hora?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto. ¿A qué nueva hora desea reprogramar su cita?
+        </Say>
+
+    </Gather>
 
     <Say language="es-MX">
-        Perfecto {conversacion.nombre}.
-        Su cita fue agendada para el día
-        {conversacion.fecha}
-        a las
-        {hora} horas. Gracias por usar nuestro sistema de citas. 
+        No recibí la hora. Intente nuevamente.
     </Say>
+</Response>
+"""
 
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )
+
+
+@router.post("/reprogramar-hora")
+async def reprogramar_hora(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    hora = normalizar_hora(SpeechResult.strip())
+
+    print("ENTRO A REPROGRAMAR_HORA")
+    print(f"Hora normalizada: {hora}")
+
+    if hora == "AMBIGUA":
+        conversacion = (
+            db.query(Conversacion)
+            .filter(Conversacion.telefono == telefono)
+            .first()
+        )
+
+        if not conversacion:
+            return Response(
+                content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+                media_type="application/xml"
+            )
+
+        conversacion.hora = SpeechResult.strip()
+        conversacion.paso = "ACLARAR_HORA_REPROGRAMAR"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/aclarar-hora-reprogramar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            ¿Se refiere a las {SpeechResult} de la mañana o de la tarde?
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí la aclaración. Intente nuevamente.
+    </Say>
+</Response>
+"""
+
+        return Response(content=twiml, media_type="application/xml")
+
+    if hora is None:
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-hora?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            No entendí la hora.
+        </Say>
+
+        <Say language="es-MX">
+            Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí ninguna respuesta. Intente nuevamente.
+    </Say>
+</Response>
+"""
+
+        return Response(content=twiml, media_type="application/xml")
+
+    conversacion = (
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    cita_anterior = (
+        db.query(Cita)
+        .filter(Cita.telefono == telefono)
+        .filter(Cita.empresa_id == conversacion.empresa_id)
+        .filter(Cita.status == "AGENDADA")
+        .first()
+    )
+
+    if not cita_anterior:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una cita activa para reprogramar.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    cita_anterior.status = "CANCELADA"
+
+    nueva_cita = Cita(
+        nombre=cita_anterior.nombre,
+        telefono=telefono,
+        fecha=conversacion.fecha,
+        hora=hora,
+        status="AGENDADA",
+        empresa_id=conversacion.empresa_id
+    )
+
+    db.add(nueva_cita)
+    db.delete(conversacion)
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Say language="es-MX">
+        Su cita fue reprogramada correctamente para el día
+        {nueva_cita.fecha}
+        a las
+        {nueva_cita.hora} horas.
+    </Say>
 </Response>
 """
 
     return Response(content=twiml, media_type="application/xml")
+
+@router.post("/aclarar-hora-reprogramar")
+async def aclarar_hora_reprogramar(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db)
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    respuesta = SpeechResult.lower().strip()
+
+    conversacion = (
+        db.query(Conversacion)
+        .filter(Conversacion.telefono == telefono)
+        .first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    hora_original = conversacion.hora
+
+    try:
+        numero = int("".join(filter(str.isdigit, hora_original)))
+    except:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No pude identificar la hora.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    if "tarde" in respuesta or "noche" in respuesta:
+        hora_final = f"{numero + 12:02d}:00"
+    else:
+        hora_final = f"{numero:02d}:00"
+
+    cita_anterior = (
+        db.query(Cita)
+        .filter(Cita.telefono == telefono)
+        .filter(Cita.empresa_id == conversacion.empresa_id)
+        .filter(Cita.status == "AGENDADA")
+        .first()
+    )
+
+    if not cita_anterior:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una cita activa para reprogramar.
+    </Say>
+</Response>
+""",
+            media_type="application/xml"
+        )
+
+    cita_anterior.status = "CANCELADA"
+
+    nueva_cita = Cita(
+        nombre=cita_anterior.nombre,
+        telefono=telefono,
+        fecha=conversacion.fecha,
+        hora=hora_final,
+        status="AGENDADA",
+        empresa_id=conversacion.empresa_id
+    )
+
+    db.add(nueva_cita)
+
+    db.delete(conversacion)
+
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Say language="es-MX">
+        Su cita fue reprogramada correctamente para el día
+        {nueva_cita.fecha}
+        a las
+        {hora_final} horas.
+    </Say>
+</Response>
+"""
+
+    return Response(
+        content=twiml,
+        media_type="application/xml"
+    )

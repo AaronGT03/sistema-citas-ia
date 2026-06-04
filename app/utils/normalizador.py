@@ -1,24 +1,23 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 MESES = {
-    "enero": "01",
-    "febrero": "02",
-    "marzo": "03",
-    "abril": "04",
-    "mayo": "05",
-    "junio": "06",
-    "julio": "07",
-    "agosto": "08",
-    "septiembre": "09",
-    "setiembre": "09",
-    "octubre": "10",
-    "noviembre": "11",
-    "diciembre": "12",
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
 }
 
 NUMEROS = {
-    "uno": 1,
-    "una": 1,
+    "uno": 1, "una": 1,
     "dos": 2,
     "tres": 3,
     "cuatro": 4,
@@ -33,73 +32,101 @@ NUMEROS = {
     "trece": 13,
     "catorce": 14,
     "quince": 15,
-    "dieciseis": 16,
-    "dieciséis": 16,
+    "dieciseis": 16, "dieciséis": 16,
     "diecisiete": 17,
     "dieciocho": 18,
     "diecinueve": 19,
     "veinte": 20,
     "veintiuno": 21,
-    "veintidos": 22,
-    "veintidós": 22,
-    "veintitres": 23,
-    "veintitrés": 23,
+    "veintidos": 22, "veintidós": 22,
+    "veintitres": 23, "veintitrés": 23,
     "veinticuatro": 24,
     "veinticinco": 25,
-    "veintiseis": 26,
-    "veintiséis": 26,
+    "veintiseis": 26, "veintiséis": 26,
     "veintisiete": 27,
     "veintiocho": 28,
     "veintinueve": 29,
     "treinta": 30,
-    "treinta y uno": 31
+    "treinta y uno": 31,
 }
 
-def normalizar_fecha(texto):
-    texto = texto.lower().strip()
 
-    dia = None
-    mes = None
+def _obtener_numero(texto: str):
+    texto = texto.lower()
 
-    for palabra, numero in NUMEROS.items():
+    for palabra in sorted(NUMEROS, key=len, reverse=True):
         if palabra in texto:
-            dia = str(numero).zfill(2)
+            return NUMEROS[palabra]
 
-    for p in texto.split():
-        if p.isdigit():
-            dia = p.zfill(2)
+    for parte in texto.split():
+        if parte.isdigit():
+            return int(parte)
+
+    return None
+
+
+def normalizar_fecha(texto: str) -> str | None:
+    texto = texto.lower().strip()
+    hoy = datetime.now()
+
+    if texto == "pasado mañana":
+        fecha = hoy + timedelta(days=2)
+        return fecha.strftime("%d/%m/%Y")
+
+    if texto == "mañana":
+        fecha = hoy + timedelta(days=1)
+        return fecha.strftime("%d/%m/%Y")
+
+    dia = _obtener_numero(texto)
+    mes = None
 
     for nombre_mes, numero_mes in MESES.items():
         if nombre_mes in texto:
             mes = numero_mes
+            break
 
-    if dia and mes:
-        return f"{dia}/{mes}/{datetime.now().year}"
+    if dia and mes and 1 <= dia <= 31:
+        return f"{dia:02d}/{mes:02d}/{hoy.year}"
 
-    return texto
-    
-def normalizar_hora(texto):
+    return None
+
+
+def normalizar_hora(texto: str) -> str | None:
     texto = texto.lower().strip()
 
-    hora = None
-
-    for palabra, numero in NUMEROS.items():
-        if palabra in texto:
-            hora = numero
-
-    for p in texto.split():
-        if p.isdigit():
-            hora = int(p)
+    hora = _obtener_numero(texto)
+    minutos = 0
 
     if hora is None:
-        return texto
+        return None
 
-    if "tarde" in texto:
+    if "media" in texto:
+        minutos = 30
+
+    if "cuarto" in texto and "para" not in texto:
+        minutos = 15
+
+    if "para" in texto and "cuarto" in texto:
+        hora -= 1
+        minutos = 45
+
+    if "tarde" in texto or "noche" in texto:
         if hora < 12:
             hora += 12
 
-    elif "noche" in texto:
-        if hora < 12:
-            hora += 12
+    if "mañana" in texto:
+        if hora == 12:
+            hora = 0
 
-    return f"{hora:02d}:00"
+    if 1 <= hora <= 11:
+        if (
+            "mañana" not in texto
+            and "tarde" not in texto
+            and "noche" not in texto
+        ):
+            return "AMBIGUA"
+
+    if hora < 0 or hora > 23:
+        return None
+
+    return f"{hora:02d}:{minutos:02d}"
