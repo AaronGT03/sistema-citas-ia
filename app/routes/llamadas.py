@@ -9,6 +9,29 @@ from app.utils.normalizador import normalizar_fecha, normalizar_hora
 router = APIRouter()
 
 
+def existe_cita_en_horario(db, empresa_id, fecha, hora):
+    return (
+        db.query(Cita)
+        .filter(Cita.empresa_id == empresa_id)
+        .filter(Cita.fecha == fecha)
+        .filter(Cita.hora == hora)
+        .filter(Cita.status == "AGENDADA")
+        .first()
+    )
+
+
+def respuesta_horario_ocupado():
+    twiml = """
+<Response>
+    <Say language="es-MX">
+        Ya existe una cita programada para esa fecha y hora.
+        Por favor seleccione otro horario.
+    </Say>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
 @router.post("/llamada")
 async def llamada(
     From: str = Form(...), To: str = Form(...), db: Session = Depends(get_db)
@@ -139,7 +162,6 @@ async def procesar_cita(
         )
 
     if "cancel" in respuesta:
-
         cita.status = "CANCELADA"
 
         db.commit()
@@ -156,17 +178,11 @@ async def procesar_cita(
         print("=== CANCELACION ===")
         print(twiml)
 
-        return Response(
-            content=twiml,
-            media_type="application/xml"
-        )
+        return Response(content=twiml, media_type="application/xml")
 
     elif "reprogramar" in respuesta:
-
         conversacion_existente = (
-            db.query(Conversacion)
-            .filter(Conversacion.telefono == telefono)
-            .first()
+            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
         )
 
         if conversacion_existente:
@@ -174,9 +190,7 @@ async def procesar_cita(
             db.commit()
 
         nueva_conversacion = Conversacion(
-            telefono=telefono,
-            empresa_id=empresa_id,
-            paso="REPROGRAMAR_FECHA"
+            telefono=telefono, empresa_id=empresa_id, paso="REPROGRAMAR_FECHA"
         )
 
         db.add(nueva_conversacion)
@@ -200,10 +214,7 @@ async def procesar_cita(
 </Response>
 """
 
-        return Response(
-            content=twiml,
-            media_type="application/xml"
-        )
+        return Response(content=twiml, media_type="application/xml")
 
     return Response(
         content="""
@@ -215,6 +226,7 @@ async def procesar_cita(
 """,
         media_type="application/xml",
     )
+
 
 @router.post("/procesar-agenda")
 async def procesar_agenda(
@@ -354,9 +366,7 @@ async def guardar_nombre(
 
 @router.post("/guardar-fecha")
 async def guardar_fecha(
-    telefono: str,
-    SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -383,18 +393,13 @@ async def guardar_fecha(
 </Response>
 """
 
-        return Response(
-            content=twiml,
-            media_type="application/xml"
-        )
+        return Response(content=twiml, media_type="application/xml")
 
     print("ENTRO A GUARDAR_FECHA")
     print(f"Fecha recibida: {fecha}")
 
     conversacion = (
-        db.query(Conversacion)
-        .filter(Conversacion.telefono == telefono)
-        .first()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
 
     if not conversacion:
@@ -432,17 +437,12 @@ async def guardar_fecha(
 </Response>
 """
 
-    return Response(
-        content=twiml,
-        media_type="application/xml"
-    )
+    return Response(content=twiml, media_type="application/xml")
 
 
 @router.post("/guardar-hora")
 async def guardar_hora(
-    telefono: str,
-    SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -452,9 +452,7 @@ async def guardar_hora(
 
     if hora == "AMBIGUA":
         conversacion = (
-            db.query(Conversacion)
-            .filter(Conversacion.telefono == telefono)
-            .first()
+            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
         )
 
         if not conversacion:
@@ -495,10 +493,7 @@ async def guardar_hora(
 </Response>
 """
 
-        return Response(
-            content=twiml,
-            media_type="application/xml"
-        )
+        return Response(content=twiml, media_type="application/xml")
 
     if hora is None:
         twiml = f"""
@@ -527,18 +522,13 @@ async def guardar_hora(
 </Response>
 """
 
-        return Response(
-            content=twiml,
-            media_type="application/xml"
-        )
+        return Response(content=twiml, media_type="application/xml")
 
     print("ENTRO A GUARDAR_HORA")
     print(f"Hora recibida: {hora}")
 
     conversacion = (
-        db.query(Conversacion)
-        .filter(Conversacion.telefono == telefono)
-        .first()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
 
     if not conversacion:
@@ -555,13 +545,45 @@ async def guardar_hora(
 
     conversacion.hora = hora
 
+    empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+
+    if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+        twiml = f"""
+    <Response>
+        <Say language="es-MX">
+            Lo sentimos.
+            El horario de atención es de
+            {empresa.horario_inicio}
+            a
+            {empresa.horario_fin}.
+        </Say>
+
+        <Gather
+            input="speech"
+            language="es-MX"
+            action="/guardar-hora?telefono={telefono}"
+            method="POST"
+            timeout="8"
+            speechTimeout="auto">
+
+            <Say language="es-MX">
+                Por favor indique otra hora disponible.
+            </Say>
+
+        </Gather>
+    </Response>
+    """
+
+        return Response(content=twiml, media_type="application/xml")
+    if existe_cita_en_horario(db, conversacion.empresa_id, conversacion.fecha, hora):
+        return respuesta_horario_ocupado()
     nueva_cita = Cita(
         nombre=conversacion.nombre,
         telefono=telefono,
         fecha=conversacion.fecha,
         hora=hora,
         status="AGENDADA",
-        empresa_id=conversacion.empresa_id
+        empresa_id=conversacion.empresa_id,
     )
 
     db.add(nueva_cita)
@@ -579,16 +601,12 @@ async def guardar_hora(
 </Response>
 """
 
-    return Response(
-        content=twiml,
-        media_type="application/xml"
-    )
+    return Response(content=twiml, media_type="application/xml")
+
 
 @router.post("/aclarar-hora")
 async def aclarar_hora(
-    telefono: str,
-    SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -597,9 +615,7 @@ async def aclarar_hora(
     respuesta = SpeechResult.lower().strip()
 
     conversacion = (
-        db.query(Conversacion)
-        .filter(Conversacion.telefono == telefono)
-        .first()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
 
     if not conversacion:
@@ -611,7 +627,7 @@ async def aclarar_hora(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
     hora_original = conversacion.hora
@@ -627,13 +643,32 @@ async def aclarar_hora(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
     if "tarde" in respuesta or "noche" in respuesta:
         hora_final = f"{numero + 12:02d}:00"
     else:
         hora_final = f"{numero:02d}:00"
+    empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+
+    if hora_final < empresa.horario_inicio or hora_final > empresa.horario_fin:
+        twiml = f"""
+    <Response>
+        <Say language="es-MX">
+            Lo sentimos.
+            El horario de atención es de
+            {empresa.horario_inicio}
+            a
+            {empresa.horario_fin}.
+        </Say>
+    </Response>
+    """
+        return Response(content=twiml, media_type="application/xml")
+    if existe_cita_en_horario(
+        db, conversacion.empresa_id, conversacion.fecha, hora_final
+    ):
+        return respuesta_horario_ocupado()
 
     nueva_cita = Cita(
         nombre=conversacion.nombre,
@@ -641,7 +676,7 @@ async def aclarar_hora(
         fecha=conversacion.fecha,
         hora=hora_final,
         status="AGENDADA",
-        empresa_id=conversacion.empresa_id
+        empresa_id=conversacion.empresa_id,
     )
 
     db.add(nueva_cita)
@@ -662,16 +697,12 @@ async def aclarar_hora(
 </Response>
 """
 
-    return Response(
-        content=twiml,
-        media_type="application/xml"
-    )
+    return Response(content=twiml, media_type="application/xml")
+
 
 @router.post("/reprogramar-fecha")
 async def reprogramar_fecha(
-    telefono: str,
-    SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -698,15 +729,10 @@ async def reprogramar_fecha(
 </Response>
 """
 
-        return Response(
-            content=twiml,
-            media_type="application/xml"
-        )
+        return Response(content=twiml, media_type="application/xml")
 
     conversacion = (
-        db.query(Conversacion)
-        .filter(Conversacion.telefono == telefono)
-        .first()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
 
     if not conversacion:
@@ -718,7 +744,7 @@ async def reprogramar_fecha(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
     conversacion.fecha = fecha
@@ -748,17 +774,12 @@ async def reprogramar_fecha(
 </Response>
 """
 
-    return Response(
-        content=twiml,
-        media_type="application/xml"
-    )
+    return Response(content=twiml, media_type="application/xml")
 
 
 @router.post("/reprogramar-hora")
 async def reprogramar_hora(
-    telefono: str,
-    SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -771,9 +792,7 @@ async def reprogramar_hora(
 
     if hora == "AMBIGUA":
         conversacion = (
-            db.query(Conversacion)
-            .filter(Conversacion.telefono == telefono)
-            .first()
+            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
         )
 
         if not conversacion:
@@ -785,7 +804,7 @@ async def reprogramar_hora(
     </Say>
 </Response>
 """,
-                media_type="application/xml"
+                media_type="application/xml",
             )
 
         conversacion.hora = SpeechResult.strip()
@@ -846,9 +865,7 @@ async def reprogramar_hora(
         return Response(content=twiml, media_type="application/xml")
 
     conversacion = (
-        db.query(Conversacion)
-        .filter(Conversacion.telefono == telefono)
-        .first()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
 
     if not conversacion:
@@ -860,7 +877,7 @@ async def reprogramar_hora(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
     cita_anterior = (
@@ -880,18 +897,35 @@ async def reprogramar_hora(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
-    cita_anterior.status = "CANCELADA"
+    empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
 
+    if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+        twiml = f"""
+    <Response>
+        <Say language="es-MX">
+            Lo sentimos.
+            El horario de atención es de
+            {empresa.horario_inicio}
+            a
+            {empresa.horario_fin}.
+        </Say>
+    </Response>
+    """
+
+        return Response(content=twiml, media_type="application/xml")
+    if existe_cita_en_horario(db, conversacion.empresa_id, conversacion.fecha, hora):
+        return respuesta_horario_ocupado()
+    cita_anterior.status = "CANCELADA"
     nueva_cita = Cita(
         nombre=cita_anterior.nombre,
         telefono=telefono,
         fecha=conversacion.fecha,
         hora=hora,
         status="AGENDADA",
-        empresa_id=conversacion.empresa_id
+        empresa_id=conversacion.empresa_id,
     )
 
     db.add(nueva_cita)
@@ -911,11 +945,10 @@ async def reprogramar_hora(
 
     return Response(content=twiml, media_type="application/xml")
 
+
 @router.post("/aclarar-hora-reprogramar")
 async def aclarar_hora_reprogramar(
-    telefono: str,
-    SpeechResult: str = Form(""),
-    db: Session = Depends(get_db)
+    telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
@@ -924,9 +957,7 @@ async def aclarar_hora_reprogramar(
     respuesta = SpeechResult.lower().strip()
 
     conversacion = (
-        db.query(Conversacion)
-        .filter(Conversacion.telefono == telefono)
-        .first()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
 
     if not conversacion:
@@ -938,7 +969,7 @@ async def aclarar_hora_reprogramar(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
     hora_original = conversacion.hora
@@ -954,7 +985,7 @@ async def aclarar_hora_reprogramar(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
     if "tarde" in respuesta or "noche" in respuesta:
@@ -979,18 +1010,41 @@ async def aclarar_hora_reprogramar(
     </Say>
 </Response>
 """,
-            media_type="application/xml"
+            media_type="application/xml",
         )
 
-    cita_anterior.status = "CANCELADA"
+    empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
 
+    if hora_final < empresa.horario_inicio or hora_final > empresa.horario_fin:
+        twiml = f"""
+    <Response>
+        <Say language="es-MX">
+            Lo sentimos.
+            El horario de atención es de
+            {empresa.horario_inicio}
+            a
+            {empresa.horario_fin}.
+        </Say>
+    </Response>
+    """
+
+        return Response(content=twiml, media_type="application/xml")
+    if existe_cita_en_horario(
+        db,
+        conversacion.empresa_id,
+        conversacion.fecha,
+        hora_final
+    ):
+        return respuesta_horario_ocupado()
+
+    cita_anterior.status = "CANCELADA"
     nueva_cita = Cita(
         nombre=cita_anterior.nombre,
         telefono=telefono,
         fecha=conversacion.fecha,
         hora=hora_final,
         status="AGENDADA",
-        empresa_id=conversacion.empresa_id
+        empresa_id=conversacion.empresa_id,
     )
 
     db.add(nueva_cita)
@@ -1010,7 +1064,4 @@ async def aclarar_hora_reprogramar(
 </Response>
 """
 
-    return Response(
-        content=twiml,
-        media_type="application/xml"
-    )
+    return Response(content=twiml, media_type="application/xml")
