@@ -30,28 +30,6 @@ def validar_acceso_empresa(
             detail="No tienes permisos para acceder a esta empresa"
         )
 
-
-@router.post("/empresas")
-def crear_empresa(
-    nombre: str,
-    telefono_twilio: str,
-    db: Session = Depends(get_db),
-    usuario_actual: dict = Depends(obtener_usuario_actual)
-):
-    validar_admin(usuario_actual)
-
-    empresa = Empresa(
-        nombre=nombre,
-        telefono_twilio=telefono_twilio
-    )
-
-    db.add(empresa)
-    db.commit()
-    db.refresh(empresa)
-
-    return empresa
-
-
 @router.get("/empresas")
 def listar_empresas(
     db: Session = Depends(get_db),
@@ -59,7 +37,33 @@ def listar_empresas(
 ):
     validar_admin(usuario_actual)
 
-    return db.query(Empresa).all()
+    empresas = db.query(Empresa).all()
+
+    return empresas
+
+@router.post("/empresas")
+def crear_empresa(
+    nombre: str,
+    telefono_twilio: str,
+    horario_inicio: str = "09:00",
+    horario_fin: str = "18:00",
+    db: Session = Depends(get_db),
+    usuario_actual: dict = Depends(obtener_usuario_actual)
+):
+    validar_admin(usuario_actual)
+
+    empresa = Empresa(
+        nombre=nombre,
+        telefono_twilio=telefono_twilio,
+        horario_inicio=horario_inicio,
+        horario_fin=horario_fin
+    )
+
+    db.add(empresa)
+    db.commit()
+    db.refresh(empresa)
+
+    return empresa
 
 
 @router.get("/empresas/{empresa_id}/citas")
