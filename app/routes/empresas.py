@@ -126,3 +126,62 @@ def obtener_resumen_empresa(
         "citas_activas": citas_activas,
         "citas_canceladas": citas_canceladas,
     }
+
+
+@router.put("/empresas/{empresa_id}")
+def editar_empresa(
+    empresa_id: int,
+    nombre: str,
+    telefono_twilio: str,
+    horario_inicio: str = "09:00",
+    horario_fin: str = "18:00",
+    activa: bool = True,
+    db: Session = Depends(get_db),
+    usuario_actual: dict = Depends(obtener_usuario_actual),
+):
+    validar_admin(usuario_actual)
+
+    empresa = db.query(Empresa).filter(Empresa.id == empresa_id).first()
+
+    if not empresa:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
+
+    existe_numero = (
+        db.query(Empresa)
+        .filter(Empresa.telefono_twilio == telefono_twilio)
+        .filter(Empresa.id != empresa_id)
+        .first()
+    )
+
+    if existe_numero:
+        raise HTTPException(
+            status_code=400, detail="Ya existe una empresa con ese número de Twilio"
+        )
+
+    empresa.nombre = nombre
+    empresa.telefono_twilio = telefono_twilio
+    empresa.horario_inicio = horario_inicio
+    empresa.horario_fin = horario_fin
+    empresa.activa = activa
+
+    db.commit()
+    db.refresh(empresa)
+
+    return empresa
+@router.delete("/empresas/{empresa_id}")
+def eliminar_empresa(
+    empresa_id: int,
+    db: Session = Depends(get_db),
+    usuario_actual: dict = Depends(obtener_usuario_actual)
+):
+    validar_admin(usuario_actual)
+
+    empresa = db.query(Empresa).filter(Empresa.id == empresa_id).first()
+
+    if not empresa:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
+
+    db.delete(empresa)
+    db.commit()
+
+    return {"mensaje": "Empresa eliminada correctamente"}
