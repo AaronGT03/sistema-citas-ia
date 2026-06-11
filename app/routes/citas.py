@@ -13,9 +13,8 @@ def listar_citas(
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
 ):
-    query = (
-        db.query(Cita, Servicio)
-        .outerjoin(Servicio, Cita.servicio_id == Servicio.id)
+    query = db.query(Cita, Servicio).outerjoin(
+        Servicio, Cita.servicio_id == Servicio.id
     )
 
     if usuario_actual["rol"] != "ADMIN":
@@ -26,19 +25,22 @@ def listar_citas(
     citas = []
 
     for cita, servicio in resultados:
-        citas.append({
-            "id": cita.id,
-            "nombre": cita.nombre,
-            "telefono": cita.telefono,
-            "fecha": cita.fecha,
-            "hora": cita.hora,
-            "status": cita.status,
-            "empresa_id": cita.empresa_id,
-            "servicio_id": cita.servicio_id,
-            "servicio_nombre": servicio.nombre if servicio else "Sin servicio",
-        })
+        citas.append(
+            {
+                "id": cita.id,
+                "nombre": cita.nombre,
+                "telefono": cita.telefono,
+                "fecha": cita.fecha,
+                "hora": cita.hora,
+                "status": cita.status,
+                "empresa_id": cita.empresa_id,
+                "servicio_id": cita.servicio_id,
+                "servicio_nombre": servicio.nombre if servicio else "Sin servicio",
+            }
+        )
 
     return citas
+
 
 @router.get("/citas/activa/{telefono}")
 def obtener_cita_activa(
