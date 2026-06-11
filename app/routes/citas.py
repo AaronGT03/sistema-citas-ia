@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Cita
+from app.models import Cita, Servicio
 from app.dependencies.auth import obtener_usuario_actual
 
 router = APIRouter()
@@ -13,11 +13,32 @@ def listar_citas(
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
 ):
-    if usuario_actual["rol"] == "ADMIN":
-        return db.query(Cita).all()
+    query = (
+        db.query(Cita, Servicio)
+        .outerjoin(Servicio, Cita.servicio_id == Servicio.id)
+    )
 
-    return db.query(Cita).filter(Cita.empresa_id == usuario_actual["empresa_id"]).all()
+    if usuario_actual["rol"] != "ADMIN":
+        query = query.filter(Cita.empresa_id == usuario_actual["empresa_id"])
 
+    resultados = query.all()
+
+    citas = []
+
+    for cita, servicio in resultados:
+        citas.append({
+            "id": cita.id,
+            "nombre": cita.nombre,
+            "telefono": cita.telefono,
+            "fecha": cita.fecha,
+            "hora": cita.hora,
+            "status": cita.status,
+            "empresa_id": cita.empresa_id,
+            "servicio_id": cita.servicio_id,
+            "servicio_nombre": servicio.nombre if servicio else "Sin servicio",
+        })
+
+    return citas
 
 @router.get("/citas/activa/{telefono}")
 def obtener_cita_activa(

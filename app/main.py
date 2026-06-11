@@ -7,6 +7,7 @@ from app.routes.llamadas import router as llamadas_router
 from app.routes.empresas import router as empresas_router
 from app.routes.auth import router as auth_router
 from app.routes.usuarios import router as usuarios_router
+from app.routes.servicios import router as servicios_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -27,7 +28,7 @@ app.include_router(llamadas_router)
 app.include_router(empresas_router)
 app.include_router(auth_router)
 app.include_router(usuarios_router)
-
+app.include_router(servicios_router)
 
 @app.get("/")
 def home():

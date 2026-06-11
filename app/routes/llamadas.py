@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from fastapi.responses import Response
 
 from app.database import get_db
-from app.models import Cita, Conversacion, Empresa
+from app.models import Cita, Conversacion, Empresa, Servicio
 from app.utils.normalizador import normalizar_fecha, normalizar_hora
 
 router = APIRouter()
@@ -263,31 +263,50 @@ async def procesar_agenda(
             db.commit()
 
         nueva_conversacion = Conversacion(
-            telefono=telefono, empresa_id=empresa_id, paso="PEDIR_NOMBRE"
+            telefono=telefono, empresa_id=empresa_id, paso="PEDIR_SERVICIO"
         )
 
         db.add(nueva_conversacion)
         db.commit()
+        servicios = (
+            db.query(Servicio)
+            .filter(Servicio.empresa_id == empresa_id, Servicio.activo == True)
+            .all()
+        )
+
+        lista_servicios = ""
+
+        for i, servicio in enumerate(servicios, start=1):
+            lista_servicios += f"""
+            <Say language="es-MX">
+                {i}. {servicio.nombre}
+            </Say>
+            """
 
         twiml = f"""
 <Response>
+
     <Gather
         input="speech"
         language="es-MX"
-        action="/guardar-nombre?telefono={telefono}"
+        action="/guardar-servicio?telefono={telefono}"
         method="POST"
         timeout="8"
         speechTimeout="auto">
 
         <Say language="es-MX">
-            Perfecto. ¿Cuál es su nombre completo?
+            Perfecto.
+            Seleccione uno de los siguientes servicios.
+        </Say>
+
+        {lista_servicios}
+
+        <Say language="es-MX">
+            Diga el número o el nombre del servicio.
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
-        No recibí su nombre. Intente nuevamente.
-    </Say>
 </Response>
 """
 
@@ -357,6 +376,119 @@ async def guardar_nombre(
 
     <Say language="es-MX">
         No recibí la fecha. Intente nuevamente.
+    </Say>
+</Response>
+"""
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/guardar-servicio")
+async def guardar_servicio(
+    telefono: str,
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    respuesta = SpeechResult.lower().strip()
+
+    conversacion = (
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
+
+    servicios = (
+        db.query(Servicio)
+        .filter(Servicio.empresa_id == conversacion.empresa_id, Servicio.activo == True)
+        .all()
+    )
+
+    servicio_seleccionado = None
+
+    if respuesta.isdigit():
+        indice = int(respuesta) - 1
+
+        if 0 <= indice < len(servicios):
+            servicio_seleccionado = servicios[indice]
+    else:
+        for servicio in servicios:
+            if (
+                servicio.nombre.lower() in respuesta
+                or respuesta in servicio.nombre.lower()
+            ):
+                servicio_seleccionado = servicio
+                break
+
+    if not servicio_seleccionado:
+        lista_servicios = ""
+
+        for i, servicio in enumerate(servicios, start=1):
+            lista_servicios += f"""
+            <Say language="es-MX">
+                {i}. {servicio.nombre}
+            </Say>
+            """
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-servicio?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            No encontré ese servicio. Por favor diga el número o el nombre exacto.
+        </Say>
+
+        {lista_servicios}
+
+    </Gather>
+</Response>
+"""
+
+        return Response(content=twiml, media_type="application/xml")
+
+    conversacion.servicio_id = servicio_seleccionado.id
+    conversacion.paso = "PEDIR_NOMBRE"
+
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-nombre?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto, seleccionó {servicio_seleccionado.nombre}.
+            ¿Cuál es su nombre completo?
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí su nombre. Intente nuevamente.
     </Say>
 </Response>
 """
@@ -584,6 +716,7 @@ async def guardar_hora(
         hora=hora,
         status="AGENDADA",
         empresa_id=conversacion.empresa_id,
+        servicio_id=conversacion.servicio_id,
     )
 
     db.add(nueva_cita)
@@ -677,6 +810,7 @@ async def aclarar_hora(
         hora=hora_final,
         status="AGENDADA",
         empresa_id=conversacion.empresa_id,
+        servicio_id=conversacion.servicio_id,
     )
 
     db.add(nueva_cita)
@@ -1030,10 +1164,7 @@ async def aclarar_hora_reprogramar(
 
         return Response(content=twiml, media_type="application/xml")
     if existe_cita_en_horario(
-        db,
-        conversacion.empresa_id,
-        conversacion.fecha,
-        hora_final
+        db, conversacion.empresa_id, conversacion.fecha, hora_final
     ):
         return respuesta_horario_ocupado()
 
