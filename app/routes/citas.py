@@ -1,12 +1,58 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Cita, Servicio
+from app.models import Cita, Servicio, Servicio
 from app.dependencies.auth import obtener_usuario_actual
 
 router = APIRouter()
 
+
+@router.post("/citas")
+def crear_cita(
+    nombre: str,
+    telefono: str,
+    fecha: str,
+    hora: str,
+    servicio_id: int,
+    db: Session = Depends(get_db),
+    usuario_actual: dict = Depends(obtener_usuario_actual),
+):
+    empresa_id = usuario_actual["empresa_id"]
+
+    cita_existente = (
+        db.query(Cita)
+        .filter(Cita.empresa_id == empresa_id)
+        .filter(Cita.fecha == fecha)
+        .filter(Cita.hora == hora)
+        .filter(Cita.status == "AGENDADA")
+        .first()
+    )
+
+    if cita_existente:
+        raise HTTPException(
+            status_code=400,
+            detail="Ya existe una cita agendada en esa fecha y hora",
+        )
+
+    nueva_cita = Cita(
+        nombre=nombre,
+        telefono=telefono,
+        fecha=fecha,
+        hora=hora,
+        status="AGENDADA",
+        empresa_id=empresa_id,
+        servicio_id=servicio_id,
+    )
+
+    db.add(nueva_cita)
+    db.commit()
+    db.refresh(nueva_cita)
+
+    return {
+        "mensaje": "Cita creada correctamente",
+        "cita": nueva_cita,
+    }
 
 @router.get("/citas")
 def listar_citas(
