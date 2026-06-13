@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String,ForeignKey
 from app.database import Base
 
 
@@ -12,3 +12,4 @@ class Conversacion(Base):
     nombre = Column(String, nullable=True)
     fecha = Column(String, nullable=True)
     hora = Column(String, nullable=True)
+    servicio_id = Column(Integer, ForeignKey("servicios.id"), nullable=True)

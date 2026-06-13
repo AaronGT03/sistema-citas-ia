@@ -14,3 +14,4 @@ class Cita(Base):
     status = Column(String, default="AGENDADA")
     created_at = Column(DateTime, default=datetime.utcnow)
     empresa_id = Column(Integer, ForeignKey("empresas.id"))
+    servicio_id = Column(Integer, ForeignKey("servicios.id"), nullable=True)
