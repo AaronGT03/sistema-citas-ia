@@ -121,8 +121,9 @@ def reprogramar_cita(
         fecha=nueva_fecha,
         hora=nueva_hora,
         status="AGENDADA",
+        empresa_id=cita_anterior.empresa_id,
+        servicio_id=cita_anterior.servicio_id,
     )
-
     db.add(nueva_cita)
     db.commit()
     db.refresh(nueva_cita)

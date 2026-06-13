@@ -287,12 +287,11 @@ async def procesar_agenda(
 <Response>
 
     <Gather
-        input="speech"
-        language="es-MX"
-        action="/guardar-servicio?telefono={telefono}"
-        method="POST"
-        timeout="8"
-        speechTimeout="auto">
+    input="dtmf"
+    numDigits="1"
+    action="/guardar-servicio?telefono={telefono}"
+    method="POST"
+    timeout="10">
 
         <Say language="es-MX">
             Perfecto.
@@ -302,8 +301,8 @@ async def procesar_agenda(
         {lista_servicios}
 
         <Say language="es-MX">
-            Diga el número o el nombre del servicio.
-        </Say>
+    Presione en su teléfono el número del servicio que desea.
+</Say>
 
     </Gather>
 
@@ -386,15 +385,14 @@ async def guardar_nombre(
 @router.post("/guardar-servicio")
 async def guardar_servicio(
     telefono: str,
-    SpeechResult: str = Form(""),
+    Digits: str = Form(""),
     db: Session = Depends(get_db),
 ):
     telefono = telefono.replace("%2B", "+")
     telefono = telefono.replace(" ", "")
     telefono = telefono if telefono.startswith("+") else "+" + telefono
 
-    respuesta = SpeechResult.lower().strip()
-
+    opcion = Digits.strip()
     conversacion = (
         db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
@@ -416,22 +414,13 @@ async def guardar_servicio(
         .filter(Servicio.empresa_id == conversacion.empresa_id, Servicio.activo == True)
         .all()
     )
-
     servicio_seleccionado = None
 
-    if respuesta.isdigit():
-        indice = int(respuesta) - 1
+    if opcion.isdigit():
+        indice = int(opcion) - 1
 
         if 0 <= indice < len(servicios):
             servicio_seleccionado = servicios[indice]
-    else:
-        for servicio in servicios:
-            if (
-                servicio.nombre.lower() in respuesta
-                or respuesta in servicio.nombre.lower()
-            ):
-                servicio_seleccionado = servicio
-                break
 
     if not servicio_seleccionado:
         lista_servicios = ""
@@ -446,16 +435,13 @@ async def guardar_servicio(
         twiml = f"""
 <Response>
     <Gather
-        input="speech"
-        language="es-MX"
-        action="/guardar-servicio?telefono={telefono}"
-        method="POST"
-        timeout="8"
-        speechTimeout="auto">
+    input="dtmf"
+    numDigits="1"
+    action="/guardar-servicio?telefono={telefono}"
+    method="POST"
+    timeout="10">
 
-        <Say language="es-MX">
-            No encontré ese servicio. Por favor diga el número o el nombre exacto.
-        </Say>
+        No encontré ese servicio. Por favor presione un número válido.
 
         {lista_servicios}
 
