@@ -1,7 +1,6 @@
 from sqlalchemy import Column, ForeignKey, Integer, String, DateTime
 from datetime import datetime
 from app.database import Base
-from fastapi import APIRouter, Depends, HTTPException
 
 
 class Cita(Base):
