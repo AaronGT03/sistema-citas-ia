@@ -4,20 +4,16 @@ from fastapi.responses import Response
 
 from app.database import get_db
 from app.models import Cita, Conversacion, Empresa, Servicio
-from app.utils.normalizador import normalizar_fecha, normalizar_hora
+from app.utils import normalizar_fecha, normalizar_hora
+from app.services.citas_service import (
+    existe_cita_en_horario,
+    crear_cita,
+    cancelar_cita,
+    reprogramar_cita,
+)
 
 router = APIRouter()
 
-
-def existe_cita_en_horario(db, empresa_id, fecha, hora):
-    return (
-        db.query(Cita)
-        .filter(Cita.empresa_id == empresa_id)
-        .filter(Cita.fecha == fecha)
-        .filter(Cita.hora == hora)
-        .filter(Cita.status == "AGENDADA")
-        .first()
-    )
 
 
 def respuesta_horario_ocupado():
@@ -162,9 +158,7 @@ async def procesar_cita(
         )
 
     if "cancel" in respuesta:
-        cita.status = "CANCELADA"
-
-        db.commit()
+        cancelar_cita(db, cita)
 
         twiml = """
 <Response>
@@ -1039,16 +1033,14 @@ async def reprogramar_hora(
     if existe_cita_en_horario(db, conversacion.empresa_id, conversacion.fecha, hora):
         return respuesta_horario_ocupado()
     cita_anterior.status = "CANCELADA"
-    nueva_cita = Cita(
-        nombre=cita_anterior.nombre,
-        telefono=telefono,
-        fecha=conversacion.fecha,
-        hora=hora,
-        status="AGENDADA",
-        empresa_id=conversacion.empresa_id,
+    nueva_cita = reprogramar_cita(
+        db=db,
+        cita_anterior=cita_anterior,
+        nueva_fecha=conversacion.fecha,
+        nueva_hora=hora,
+        canal="LLAMADA",
     )
 
-    db.add(nueva_cita)
     db.delete(conversacion)
     db.commit()
 
@@ -1155,21 +1147,19 @@ async def aclarar_hora_reprogramar(
         return respuesta_horario_ocupado()
 
     cita_anterior.status = "CANCELADA"
-    nueva_cita = Cita(
-        nombre=cita_anterior.nombre,
+    nueva_cita = crear_cita(
+        db=db,
+        nombre=conversacion.nombre,
         telefono=telefono,
         fecha=conversacion.fecha,
         hora=hora_final,
-        status="AGENDADA",
         empresa_id=conversacion.empresa_id,
+        servicio_id=conversacion.servicio_id,
+        canal="LLAMADA",
     )
 
-    db.add(nueva_cita)
-
     db.delete(conversacion)
-
     db.commit()
-
     twiml = f"""
 <Response>
     <Say language="es-MX">

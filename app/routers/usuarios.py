@@ -3,8 +3,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import Usuario, Empresa
-from app.utils.security import generar_hash
-from app.dependencies.auth import obtener_usuario_actual
+from app.utils import generar_hash
+from app.dependencies import obtener_usuario_actual
 
 router = APIRouter()
 
