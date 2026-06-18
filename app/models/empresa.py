@@ -8,23 +8,12 @@ class Empresa(Base):
     id = Column(Integer, primary_key=True)
     nombre = Column(String, nullable=False)
 
-    telefono_twilio = Column(
-        String,
-        unique=True,
-        nullable=False
-    )
+    telefono_twilio = Column(String, unique=True, nullable=True)
 
-    activa = Column(
-        Boolean,
-        default=True
-    )
+    activa = Column(Boolean, default=True)
 
-    horario_inicio = Column(
-        String,
-        default="09:00"
-    )
+    horario_inicio = Column(String, default="09:00")
+    horario_fin = Column(String, default="18:00")
 
-    horario_fin = Column(
-        String,
-        default="18:00"
-    )
+    giro = Column(String, nullable=True)
+    prompt_base = Column(String, nullable=True)
