@@ -7,7 +7,6 @@ from app.services.whatsapp_service import (
     enviar_mensaje_whatsapp,
     enviar_botones_whatsapp,
 )
-from app.services.openai_service import generar_respuesta
 from app.services.citas_service import (
     crear_cita,
     existe_cita_en_horario,
@@ -51,21 +50,26 @@ def obtener_flujo_activo(db: Session, empresa_id: int, telefono_cliente: str):
 
 
 def limpiar_flujos_activos(db: Session, empresa_id: int, telefono_cliente: str):
-    flujos = (
+    flujo = (
         db.query(Conversacion)
         .filter(
             Conversacion.empresa_id == empresa_id,
             Conversacion.telefono == telefono_cliente,
             Conversacion.canal == "WHATSAPP",
-            Conversacion.paso != None,
         )
-        .all()
+        .order_by(Conversacion.id.desc())
+        .first()
     )
 
-    for flujo in flujos:
+    if flujo:
         flujo.paso = None
-
-    db.commit()
+        flujo.nombre = None
+        flujo.fecha = None
+        flujo.hora = None
+        flujo.servicio_id = None
+        flujo.mensaje = None
+        flujo.respuesta = None
+        db.commit()
 
 
 def guardar_conversacion(
@@ -80,12 +84,42 @@ def guardar_conversacion(
     hora: str | None = None,
     servicio_id: int | None = None,
 ):
-    conversacion = Conversacion(
+    flujo = (
+        db.query(Conversacion)
+        .filter(
+            Conversacion.empresa_id == empresa_id,
+            Conversacion.telefono == telefono_cliente,
+            Conversacion.canal == "WHATSAPP",
+        )
+        .order_by(Conversacion.id.desc())
+        .first()
+    )
+
+    if flujo:
+        flujo.paso = paso
+        flujo.nombre = nombre
+        flujo.fecha = fecha
+        flujo.hora = hora
+        flujo.servicio_id = servicio_id
+
+        # Ya no guardamos mensajes ni respuestas
+        flujo.mensaje = None
+        flujo.respuesta = None
+
+        db.commit()
+        db.refresh(flujo)
+
+        return flujo
+
+    flujo = Conversacion(
         empresa_id=empresa_id,
         telefono=telefono_cliente,
         canal="WHATSAPP",
-        mensaje=mensaje,
-        respuesta=respuesta,
+
+        # Ya no guardamos mensajes ni respuestas
+        mensaje=None,
+        respuesta=None,
+
         paso=paso,
         nombre=nombre,
         fecha=fecha,
@@ -93,11 +127,11 @@ def guardar_conversacion(
         servicio_id=servicio_id,
     )
 
-    db.add(conversacion)
+    db.add(flujo)
     db.commit()
-    db.refresh(conversacion)
+    db.refresh(flujo)
 
-    return conversacion
+    return flujo
 
 
 def enviar_respuesta(numero, telefono_cliente: str, respuesta: str):
@@ -465,8 +499,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 respuesta=respuesta,
             )
 
-            flujo.paso = None
-            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             enviar_menu_principal(
@@ -541,8 +573,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 servicio_id=flujo.servicio_id,
             )
 
-            flujo.paso = None
-            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "REPROGRAMAR_HORA"}
@@ -571,8 +601,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     servicio_id=flujo.servicio_id,
                 )
 
-                flujo.paso = None
-                db.commit()
 
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "REPROGRAMAR_ACLARAR_HORA"}
@@ -721,8 +749,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 respuesta=respuesta,
             )
 
-            flujo.paso = None
-            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             enviar_menu_principal(
@@ -908,8 +934,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     respuesta=respuesta,
                 )
 
-                flujo.paso = None
-                db.commit()
 
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "CITA_REPROGRAMADA"}
@@ -962,8 +986,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     servicio_id=servicio_seleccionado.id,
                 )
 
-                flujo.paso = None
-                db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "PEDIR_NOMBRE"}
@@ -991,8 +1013,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 servicio_id=flujo.servicio_id,
             )
 
-            flujo.paso = None
-            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "PEDIR_FECHA"}
@@ -1057,8 +1077,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 servicio_id=flujo.servicio_id,
             )
 
-            flujo.paso = None
-            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "PEDIR_HORA"}
@@ -1087,8 +1105,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     servicio_id=flujo.servicio_id,
                 )
 
-                flujo.paso = None
-                db.commit()
 
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "ACLARAR_HORA"}
@@ -1243,8 +1259,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 servicio_id=cita.servicio_id,
             )
 
-            flujo.paso = None
-            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             enviar_menu_principal(
@@ -1409,8 +1423,6 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 servicio_id=cita.servicio_id,
             )
 
-            flujo.paso = None
-            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "CITA_AGENDADA", "cita_id": cita.id}
@@ -1418,23 +1430,22 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
         # =========================
         # OPENAI NORMAL
         # =========================
-        respuesta = generar_respuesta(
-            prompt_base=empresa.prompt_base,
-            mensaje_usuario=mensaje,
+        # RESPUESTA DEFAULT SIN OPENAI
+        respuesta = (
+            "No entendí tu mensaje.\n\n"
+            "Por favor usa el menú para continuar."
         )
-
-        guardar_conversacion(
-            db=db,
-            empresa_id=empresa.id,
-            telefono_cliente=telefono_cliente,
-            mensaje=mensaje,
-            respuesta=respuesta,
-        )
-
-        print("RESPUESTA:", respuesta)
 
         enviar_respuesta(numero, telefono_cliente, respuesta)
-        return {"status": "ok"}
+
+        enviar_menu_principal(
+            db=db,
+            empresa=empresa,
+            numero=numero,
+            telefono_cliente=telefono_cliente,
+        )
+
+        return {"status": "MENSAJE_NO_ENTENDIDO"}
 
     except Exception as e:
         print("Evento ignorado:", str(e))
