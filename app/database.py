@@ -1,19 +1,23 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-
-DATABASE_URL = "sqlite:///./citas.db"
+from app.core.config import DATABASE_URL
 
 print("DATABASE_URL USADA:", DATABASE_URL)
 
+connect_args = {}
+
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False}
+    connect_args=connect_args,
 )
 
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
-    bind=engine
+    bind=engine,
 )
 
 Base = declarative_base()
