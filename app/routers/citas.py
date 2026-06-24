@@ -20,6 +20,12 @@ def crear_cita(
 ):
     empresa_id = usuario_actual["empresa_id"]
 
+    if empresa_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="El usuario ADMIN no puede crear citas directamente. Usa un usuario EMPRESA.",
+        )
+
     cita_existente = (
         db.query(Cita)
         .filter(Cita.empresa_id == empresa_id)
@@ -53,6 +59,7 @@ def crear_cita(
         "mensaje": "Cita creada correctamente",
         "cita": nueva_cita,
     }
+
 
 @router.get("/citas")
 def listar_citas(

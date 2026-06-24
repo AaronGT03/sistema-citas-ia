@@ -13,6 +13,10 @@ from app.services.citas_service import (
     existe_cita_en_horario,
     cancelar_cita,
     reprogramar_cita,
+    obtener_horarios_disponibles,
+    fecha_ya_paso,
+    hora_ya_paso,
+    horario_choca_con_duracion,
 )
 from app.utils import normalizar_fecha, normalizar_hora, normalizar_telefono_mexico
 from app.core.config import META_VERIFY_TOKEN
@@ -496,10 +500,12 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     hora=flujo.hora,
                     servicio_id=flujo.servicio_id,
                 )
-            else:
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "REPROGRAMAR_FECHA"}
+
+            elif fecha_ya_paso(nueva_fecha):
                 respuesta = (
-                    f"Perfecto. Nueva fecha: {nueva_fecha}.\n\n"
-                    "¿A qué nueva hora deseas la cita?"
+                    "La fecha que elegiste ya pasó.\nPor favor indica una fecha futura."
                 )
 
                 guardar_conversacion(
@@ -508,15 +514,35 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     telefono_cliente=telefono_cliente,
                     mensaje=mensaje,
                     respuesta=respuesta,
-                    paso="REPROGRAMAR_HORA",
+                    paso="REPROGRAMAR_FECHA",
                     nombre=flujo.nombre,
-                    fecha=nueva_fecha,
+                    fecha=flujo.fecha,
                     hora=flujo.hora,
                     servicio_id=flujo.servicio_id,
                 )
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "REPROGRAMAR_FECHA"}
 
-                flujo.paso = None
-                db.commit()
+            respuesta = (
+                f"Perfecto. Nueva fecha: {nueva_fecha}.\n\n"
+                "¿A qué nueva hora deseas la cita?"
+            )
+
+            guardar_conversacion(
+                db=db,
+                empresa_id=empresa.id,
+                telefono_cliente=telefono_cliente,
+                mensaje=mensaje,
+                respuesta=respuesta,
+                paso="REPROGRAMAR_HORA",
+                nombre=flujo.nombre,
+                fecha=nueva_fecha,
+                hora=flujo.hora,
+                servicio_id=flujo.servicio_id,
+            )
+
+            flujo.paso = None
+            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "REPROGRAMAR_HORA"}
@@ -571,6 +597,24 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "REPROGRAMAR_HORA"}
 
+            if hora_ya_paso(flujo.fecha, nueva_hora):
+                respuesta = "Esa hora ya pasó.\nPor favor indica una hora futura."
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="REPROGRAMAR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "HORA_YA_PASO"}
+
             cita_activa = (
                 db.query(Cita)
                 .filter(
@@ -608,11 +652,36 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "HORARIO_FUERA_DE_RANGO"}
 
-            elif existe_cita_en_horario(db, empresa.id, flujo.fecha, nueva_hora):
-                respuesta = (
-                    "Ya existe una cita programada para esa fecha y hora.\n"
-                    "Por favor selecciona otro horario."
+            cita_ocupada = horario_choca_con_duracion(
+                db=db,
+                empresa_id=empresa.id,
+                fecha=flujo.fecha,
+                hora=nueva_hora,
+                servicio_id=flujo.servicio_id,
+                cita_ignorar_id=cita_activa.id,
+            )
+
+            if cita_ocupada:
+                horarios = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=flujo.fecha,
                 )
+
+                if horarios:
+                    lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+
+                    respuesta = (
+                        "Ese horario ya está ocupado.\n\n"
+                        "Horarios disponibles para esa fecha:\n"
+                        f"{lista_horarios}\n\n"
+                        "Por favor escribe uno de esos horarios."
+                    )
+                else:
+                    respuesta = (
+                        "Ese día ya no tiene horarios disponibles.\n"
+                        "Por favor indica otra fecha."
+                    )
 
                 guardar_conversacion(
                     db=db,
@@ -702,6 +771,46 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
             else:
                 nueva_hora = f"{numero_hora:02d}:00"
 
+            if hora_ya_paso(flujo.fecha, nueva_hora):
+                respuesta = "Esa hora ya pasó.\nPor favor indica una hora futura."
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="REPROGRAMAR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "HORA_YA_PASO"}
+
+            if nueva_hora < empresa.horario_inicio or nueva_hora > empresa.horario_fin:
+                respuesta = (
+                    f"Lo siento, nuestro horario de atención es de "
+                    f"{empresa.horario_inicio} a {empresa.horario_fin}.\n\n"
+                    "Por favor indica otra hora."
+                )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="REPROGRAMAR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "HORARIO_FUERA_DE_RANGO"}
+
             cita_activa = (
                 db.query(Cita)
                 .filter(
@@ -714,7 +823,69 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
             if not cita_activa:
                 respuesta = "No encontré ninguna cita activa para reprogramar."
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="REPROGRAMAR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "SIN_CITA_ACTIVA"}
+
             else:
+                cita_ocupada = horario_choca_con_duracion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    fecha=flujo.fecha,
+                    hora=nueva_hora,
+                    servicio_id=flujo.servicio_id,
+                    cita_ignorar_id=cita_activa.id,
+                )
+
+                if cita_ocupada:
+                    horarios = obtener_horarios_disponibles(
+                        db=db,
+                        empresa=empresa,
+                        fecha=flujo.fecha,
+                    )
+
+                    if horarios:
+                        lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+
+                        respuesta = (
+                            "Ese horario ya está ocupado.\n\n"
+                            "Horarios disponibles para esa fecha:\n"
+                            f"{lista_horarios}\n\n"
+                            "Por favor escribe uno de esos horarios."
+                        )
+                    else:
+                        respuesta = (
+                            "Ese día ya no tiene horarios disponibles.\n"
+                            "Por favor indica otra fecha."
+                        )
+
+                    guardar_conversacion(
+                        db=db,
+                        empresa_id=empresa.id,
+                        telefono_cliente=telefono_cliente,
+                        mensaje=mensaje,
+                        respuesta=respuesta,
+                        paso="REPROGRAMAR_HORA",
+                        nombre=flujo.nombre,
+                        fecha=flujo.fecha,
+                        servicio_id=flujo.servicio_id,
+                    )
+
+                    enviar_respuesta(numero, telefono_cliente, respuesta)
+                    return {"status": "HORARIO_OCUPADO"}
+
                 nueva_cita = reprogramar_cita(
                     db=db,
                     cita_anterior=cita_activa,
@@ -729,19 +900,19 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     f"Hora: {nueva_cita.hora}"
                 )
 
-            guardar_conversacion(
-                db=db,
-                empresa_id=empresa.id,
-                telefono_cliente=telefono_cliente,
-                mensaje=mensaje,
-                respuesta=respuesta,
-            )
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                )
 
-            flujo.paso = None
-            db.commit()
+                flujo.paso = None
+                db.commit()
 
-            enviar_respuesta(numero, telefono_cliente, respuesta)
-            return {"status": "CITA_REPROGRAMADA"}
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "CITA_REPROGRAMADA"}
 
         # =========================
         # PEDIR SERVICIO
@@ -848,10 +1019,12 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     nombre=flujo.nombre,
                     servicio_id=flujo.servicio_id,
                 )
-            else:
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "PEDIR_FECHA"}
+
+            elif fecha_ya_paso(fecha):
                 respuesta = (
-                    f"Perfecto. Registré la fecha {fecha}.\n\n"
-                    "¿A qué hora deseas tu cita?"
+                    "La fecha que elegiste ya pasó.\nPor favor indica una fecha futura."
                 )
 
                 guardar_conversacion(
@@ -860,14 +1033,32 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     telefono_cliente=telefono_cliente,
                     mensaje=mensaje,
                     respuesta=respuesta,
-                    paso="PEDIR_HORA",
+                    paso="PEDIR_FECHA",
                     nombre=flujo.nombre,
-                    fecha=fecha,
                     servicio_id=flujo.servicio_id,
                 )
 
-                flujo.paso = None
-                db.commit()
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "PEDIR_FECHA"}
+
+            respuesta = (
+                f"Perfecto. Registré la fecha {fecha}.\n\n¿A qué hora deseas tu cita?"
+            )
+
+            guardar_conversacion(
+                db=db,
+                empresa_id=empresa.id,
+                telefono_cliente=telefono_cliente,
+                mensaje=mensaje,
+                respuesta=respuesta,
+                paso="PEDIR_HORA",
+                nombre=flujo.nombre,
+                fecha=fecha,
+                servicio_id=flujo.servicio_id,
+            )
+
+            flujo.paso = None
+            db.commit()
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "PEDIR_HORA"}
@@ -923,6 +1114,24 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "PEDIR_HORA"}
 
+            if hora_ya_paso(flujo.fecha, hora):
+                respuesta = "Esa hora ya pasó.\nPor favor indica una hora futura."
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "HORA_YA_PASO"}
+
             if hora < empresa.horario_inicio or hora > empresa.horario_fin:
                 respuesta = (
                     f"Lo siento, nuestro horario de atención es de "
@@ -945,11 +1154,42 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "HORARIO_FUERA_DE_RANGO"}
 
-            if existe_cita_en_horario(db, empresa.id, flujo.fecha, hora):
-                respuesta = (
-                    "Ya existe una cita programada para esa fecha y hora.\n"
-                    "Por favor selecciona otro horario."
+            print("VALIDANDO HORARIO")
+            print("EMPRESA:", empresa.id)
+            print("FECHA:", flujo.fecha)
+            print("HORA:", hora)
+
+            cita_ocupada = horario_choca_con_duracion(
+                db=db,
+                empresa_id=empresa.id,
+                fecha=flujo.fecha,
+                hora=hora,
+                servicio_id=flujo.servicio_id,
+            )
+
+            print("CITA OCUPADA:", cita_ocupada.id if cita_ocupada else None)
+
+            if cita_ocupada:
+                horarios = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=flujo.fecha,
                 )
+
+                if horarios:
+                    lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+
+                    respuesta = (
+                        "Ese horario ya está ocupado.\n\n"
+                        "Horarios disponibles para esa fecha:\n"
+                        f"{lista_horarios}\n\n"
+                        "Por favor escribe uno de esos horarios."
+                    )
+                else:
+                    respuesta = (
+                        "Ese día ya no tiene horarios disponibles.\n"
+                        "Por favor indica otra fecha."
+                    )
 
                 guardar_conversacion(
                     db=db,
@@ -1052,6 +1292,91 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 hora = f"{numero_hora + 12:02d}:00"
             else:
                 hora = f"{numero_hora:02d}:00"
+
+            if hora_ya_paso(flujo.fecha, hora):
+                respuesta = "Esa hora ya pasó.\nPor favor indica una hora futura."
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "HORA_YA_PASO"}
+
+            if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+                respuesta = (
+                    f"Lo siento, nuestro horario de atención es de "
+                    f"{empresa.horario_inicio} a {empresa.horario_fin}.\n\n"
+                    "Por favor indica otra hora."
+                )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "HORARIO_FUERA_DE_RANGO"}
+
+            cita_ocupada = horario_choca_con_duracion(
+                db=db,
+                empresa_id=empresa.id,
+                fecha=flujo.fecha,
+                hora=hora,
+                servicio_id=flujo.servicio_id,
+            )
+
+            if cita_ocupada:
+                horarios = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=flujo.fecha,
+                )
+
+                if horarios:
+                    lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+
+                    respuesta = (
+                        "Ese horario ya está ocupado.\n\n"
+                        "Horarios disponibles para esa fecha:\n"
+                        f"{lista_horarios}\n\n"
+                        "Por favor escribe uno de esos horarios."
+                    )
+                else:
+                    respuesta = (
+                        "Ese día ya no tiene horarios disponibles.\n"
+                        "Por favor indica otra fecha."
+                    )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "HORARIO_OCUPADO"}
 
             cita = crear_cita(
                 db=db,
