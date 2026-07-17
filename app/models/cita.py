@@ -21,3 +21,9 @@ class Cita(Base):
 
     empresa_id = Column(Integer, ForeignKey("empresas.id"))
     servicio_id = Column(Integer, ForeignKey("servicios.id"), nullable=True)
+    prestador_id = Column(
+        Integer,
+        ForeignKey("prestadores.id"),
+        nullable=True,
+        index=True,
+    )

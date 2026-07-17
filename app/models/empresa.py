@@ -17,3 +17,9 @@ class Empresa(Base):
 
     giro = Column(String, nullable=True)
     prompt_base = Column(String, nullable=True)
+
+    usa_prestadores = Column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )

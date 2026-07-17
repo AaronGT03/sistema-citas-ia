@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from fastapi.responses import Response
 
 from app.database import get_db
-from app.models import Cita, Conversacion, Empresa, Servicio
+from app.models import Cita, Conversacion, Empresa, Servicio, Prestador
 from app.utils import normalizar_fecha, normalizar_hora
 from app.services.citas_service import (
     existe_cita_en_horario,
@@ -14,6 +14,8 @@ from app.services.citas_service import (
     hora_ya_paso,
     horario_choca_con_duracion,
     obtener_horarios_disponibles,
+    obtener_prestadores_compatibles,
+    seleccionar_prestador_automaticamente,
 )
 
 router = APIRouter()
@@ -27,6 +29,52 @@ def respuesta_horario_ocupado():
         Ya existe una cita programada para esa fecha y hora.
         Por favor seleccione otro horario.
     </Say>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+def respuesta_prestador_ocupado(alternativas=None):
+    mensaje_alternativas = ""
+
+    if alternativas:
+        horas_texto = ", ".join(alternativas[:3])
+        mensaje_alternativas = f"""
+    <Say language="es-MX">
+        Los horarios disponibles más cercanos son: {horas_texto}.
+        Por favor vuelva a llamar para agendar en uno de esos horarios.
+    </Say>
+"""
+
+    twiml = f"""
+<Response>
+    <Say language="es-MX">
+        Ese barbero no está disponible en ese horario.
+    </Say>
+{mensaje_alternativas}
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+def respuesta_sin_prestadores(alternativas=None):
+    mensaje_alternativas = ""
+
+    if alternativas:
+        horas_texto = ", ".join(alternativas[:3])
+        mensaje_alternativas = f"""
+    <Say language="es-MX">
+        Los horarios disponibles más cercanos son: {horas_texto}.
+        Por favor vuelva a llamar para agendar en uno de esos horarios.
+    </Say>
+"""
+
+    twiml = f"""
+<Response>
+    <Say language="es-MX">
+        No hay barberos disponibles en ese horario.
+    </Say>
+{mensaje_alternativas}
 </Response>
 """
     return Response(content=twiml, media_type="application/xml")
@@ -187,12 +235,52 @@ async def procesar_cita(
             db.delete(conversacion_existente)
             db.commit()
 
+        empresa = db.query(Empresa).filter(Empresa.id == empresa_id).first()
+
         nueva_conversacion = Conversacion(
-            telefono=telefono, empresa_id=empresa_id, paso="REPROGRAMAR_FECHA"
+            telefono=telefono,
+            empresa_id=empresa_id,
+            servicio_id=cita.servicio_id,
+            prestador_id=cita.prestador_id,
+            paso="REPROGRAMAR_FECHA",
         )
 
         db.add(nueva_conversacion)
         db.commit()
+
+        if empresa and empresa.usa_prestadores:
+            nueva_conversacion.paso = "REPROGRAMAR_TIPO_PRESTADOR"
+            db.commit()
+
+            if cita.prestador_id:
+                mensaje_opciones = """
+        <Say language="es-MX">
+            Presione 1 para mantener a su mismo barbero.
+            Presione 2 para elegir otro barbero.
+        </Say>
+"""
+            else:
+                mensaje_opciones = """
+        <Say language="es-MX">
+            ¿Desea atenderse con un barbero específico?
+            Presione 1 para elegir un barbero.
+            Presione 2 para atenderse con cualquier barbero disponible.
+        </Say>
+"""
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/reprogramar-tipo-prestador?telefono={telefono}"
+        method="POST"
+        timeout="10">
+{mensaje_opciones}
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
 
         twiml = f"""
 <Response>
@@ -450,6 +538,38 @@ async def guardar_servicio(
         return Response(content=twiml, media_type="application/xml")
 
     conversacion.servicio_id = servicio_seleccionado.id
+
+    empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+
+    if empresa and empresa.usa_prestadores:
+        conversacion.paso = "PEDIR_TIPO_PRESTADOR"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/guardar-tipo-prestador?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX">
+            Perfecto, seleccionó {servicio_seleccionado.nombre}.
+        </Say>
+
+        <Say language="es-MX">
+            ¿Desea atenderse con un barbero específico?
+            Presione 1 para elegir un barbero.
+            Presione 2 para atenderse con cualquier barbero disponible.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+
+        return Response(content=twiml, media_type="application/xml")
+
     conversacion.paso = "PEDIR_NOMBRE"
 
     db.commit()
@@ -466,6 +586,252 @@ async def guardar_servicio(
 
         <Say language="es-MX">
             Perfecto, seleccionó {servicio_seleccionado.nombre}.
+            ¿Cuál es su nombre completo?
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí su nombre. Intente nuevamente.
+    </Say>
+</Response>
+"""
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/guardar-tipo-prestador")
+async def guardar_tipo_prestador(
+    telefono: str,
+    Digits: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    conversacion = (
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
+
+    opcion = Digits.strip()
+
+    if opcion == "2":
+        conversacion.prestador_id = None
+        conversacion.asignacion_automatica = True
+        conversacion.paso = "PEDIR_NOMBRE"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-nombre?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto, se atenderá con cualquier barbero disponible.
+            ¿Cuál es su nombre completo?
+        </Say>
+
+    </Gather>
+
+    <Say language="es-MX">
+        No recibí su nombre. Intente nuevamente.
+    </Say>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    if opcion == "1":
+        prestadores = obtener_prestadores_compatibles(
+            db, conversacion.empresa_id, conversacion.servicio_id
+        )
+
+        if not prestadores:
+            conversacion.prestador_id = None
+            conversacion.asignacion_automatica = True
+            conversacion.paso = "PEDIR_NOMBRE"
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-nombre?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Por el momento no hay barberos específicos disponibles para ese servicio.
+            Le atenderá cualquier barbero disponible.
+            ¿Cuál es su nombre completo?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        lista_prestadores = ""
+
+        for i, prestador in enumerate(prestadores, start=1):
+            lista_prestadores += f"""
+            <Say language="es-MX">
+                {i}. {prestador.nombre}
+            </Say>
+            """
+
+        conversacion.paso = "PEDIR_PRESTADOR"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/guardar-prestador?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        <Say language="es-MX">
+            Seleccione uno de los siguientes barberos.
+        </Say>
+
+        {lista_prestadores}
+
+        <Say language="es-MX">
+            Presione en su teléfono el número del barbero que desea.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/guardar-tipo-prestador?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX">
+            No entendí su respuesta.
+            Presione 1 para elegir un barbero.
+            Presione 2 para atenderse con cualquier barbero disponible.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/guardar-prestador")
+async def guardar_prestador(
+    telefono: str,
+    Digits: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    conversacion = (
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
+
+    prestadores = obtener_prestadores_compatibles(
+        db, conversacion.empresa_id, conversacion.servicio_id
+    )
+
+    opcion = Digits.strip()
+    prestador_seleccionado = None
+
+    if opcion.isdigit():
+        indice = int(opcion) - 1
+
+        if 0 <= indice < len(prestadores):
+            prestador_seleccionado = prestadores[indice]
+
+    if not prestador_seleccionado:
+        lista_prestadores = ""
+
+        for i, prestador in enumerate(prestadores, start=1):
+            lista_prestadores += f"""
+            <Say language="es-MX">
+                {i}. {prestador.nombre}
+            </Say>
+            """
+
+        twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/guardar-prestador?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        No encontré ese barbero. Por favor presione un número válido.
+
+        {lista_prestadores}
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    conversacion.prestador_id = prestador_seleccionado.id
+    conversacion.asignacion_automatica = False
+    conversacion.paso = "PEDIR_NOMBRE"
+
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-nombre?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto, se atenderá con {prestador_seleccionado.nombre}.
             ¿Cuál es su nombre completo?
         </Say>
 
@@ -734,16 +1100,60 @@ async def guardar_hora(
 
         return Response(content=twiml, media_type="application/xml")
     
-    cita_ocupada = horario_choca_con_duracion(
-        db=db,
-        empresa_id=conversacion.empresa_id,
-        fecha=conversacion.fecha,
-        hora=hora,
-        servicio_id=conversacion.servicio_id,
-    )
+    prestador_final = None
 
-    if cita_ocupada:
-        return respuesta_horario_ocupado()
+    if empresa.usa_prestadores:
+        if conversacion.prestador_id:
+            cita_ocupada = horario_choca_con_duracion(
+                db=db,
+                empresa_id=conversacion.empresa_id,
+                fecha=conversacion.fecha,
+                hora=hora,
+                servicio_id=conversacion.servicio_id,
+                prestador_id=conversacion.prestador_id,
+            )
+
+            if cita_ocupada:
+                alternativas = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=conversacion.fecha,
+                    servicio_id=conversacion.servicio_id,
+                    prestador_id=conversacion.prestador_id,
+                )
+                return respuesta_prestador_ocupado(alternativas)
+
+            prestador_final = conversacion.prestador_id
+        else:
+            prestador_seleccionado = seleccionar_prestador_automaticamente(
+                db=db,
+                empresa_id=conversacion.empresa_id,
+                servicio_id=conversacion.servicio_id,
+                fecha=conversacion.fecha,
+                hora=hora,
+            )
+
+            if not prestador_seleccionado:
+                alternativas = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=conversacion.fecha,
+                    servicio_id=conversacion.servicio_id,
+                )
+                return respuesta_sin_prestadores(alternativas)
+
+            prestador_final = prestador_seleccionado.id
+    else:
+        cita_ocupada = horario_choca_con_duracion(
+            db=db,
+            empresa_id=conversacion.empresa_id,
+            fecha=conversacion.fecha,
+            hora=hora,
+            servicio_id=conversacion.servicio_id,
+        )
+
+        if cita_ocupada:
+            return respuesta_horario_ocupado()
 
     nueva_cita = Cita(
         nombre=conversacion.nombre,
@@ -753,6 +1163,7 @@ async def guardar_hora(
         status="AGENDADA",
         empresa_id=conversacion.empresa_id,
         servicio_id=conversacion.servicio_id,
+        prestador_id=prestador_final,
     )
 
     db.add(nueva_cita)
@@ -871,16 +1282,60 @@ async def aclarar_hora(
     </Response>
     """
         return Response(content=twiml, media_type="application/xml")
-    cita_ocupada = horario_choca_con_duracion(
-        db=db,
-        empresa_id=conversacion.empresa_id,
-        fecha=conversacion.fecha,
-        hora=hora_final,
-        servicio_id=conversacion.servicio_id,
-    )
+    prestador_final = None
 
-    if cita_ocupada:
-        return respuesta_horario_ocupado()
+    if empresa.usa_prestadores:
+        if conversacion.prestador_id:
+            cita_ocupada = horario_choca_con_duracion(
+                db=db,
+                empresa_id=conversacion.empresa_id,
+                fecha=conversacion.fecha,
+                hora=hora_final,
+                servicio_id=conversacion.servicio_id,
+                prestador_id=conversacion.prestador_id,
+            )
+
+            if cita_ocupada:
+                alternativas = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=conversacion.fecha,
+                    servicio_id=conversacion.servicio_id,
+                    prestador_id=conversacion.prestador_id,
+                )
+                return respuesta_prestador_ocupado(alternativas)
+
+            prestador_final = conversacion.prestador_id
+        else:
+            prestador_seleccionado = seleccionar_prestador_automaticamente(
+                db=db,
+                empresa_id=conversacion.empresa_id,
+                servicio_id=conversacion.servicio_id,
+                fecha=conversacion.fecha,
+                hora=hora_final,
+            )
+
+            if not prestador_seleccionado:
+                alternativas = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=conversacion.fecha,
+                    servicio_id=conversacion.servicio_id,
+                )
+                return respuesta_sin_prestadores(alternativas)
+
+            prestador_final = prestador_seleccionado.id
+    else:
+        cita_ocupada = horario_choca_con_duracion(
+            db=db,
+            empresa_id=conversacion.empresa_id,
+            fecha=conversacion.fecha,
+            hora=hora_final,
+            servicio_id=conversacion.servicio_id,
+        )
+
+        if cita_ocupada:
+            return respuesta_horario_ocupado()
 
     nueva_cita = Cita(
         nombre=conversacion.nombre,
@@ -890,6 +1345,7 @@ async def aclarar_hora(
         status="AGENDADA",
         empresa_id=conversacion.empresa_id,
         servicio_id=conversacion.servicio_id,
+        prestador_id=prestador_final,
     )
 
     db.add(nueva_cita)
@@ -1004,6 +1460,268 @@ async def reprogramar_fecha(
     <Say language="es-MX">
         No recibí la hora. Intente nuevamente.
     </Say>
+</Response>
+"""
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/reprogramar-tipo-prestador")
+async def reprogramar_tipo_prestador(
+    telefono: str,
+    Digits: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    conversacion = (
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
+
+    opcion = Digits.strip()
+
+    if opcion == "1" and conversacion.prestador_id:
+        conversacion.asignacion_automatica = False
+        conversacion.paso = "REPROGRAMAR_FECHA"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    if opcion == "2" and not conversacion.prestador_id:
+        conversacion.prestador_id = None
+        conversacion.asignacion_automatica = True
+        conversacion.paso = "REPROGRAMAR_FECHA"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto, se atenderá con cualquier barbero disponible.
+            ¿Para qué nueva fecha desea reprogramar su cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    if (opcion == "2" and conversacion.prestador_id) or (
+        opcion == "1" and not conversacion.prestador_id
+    ):
+        prestadores = obtener_prestadores_compatibles(
+            db, conversacion.empresa_id, conversacion.servicio_id
+        )
+
+        if not prestadores:
+            conversacion.prestador_id = None
+            conversacion.asignacion_automatica = True
+            conversacion.paso = "REPROGRAMAR_FECHA"
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Por el momento no hay barberos específicos disponibles para ese servicio.
+            Le atenderá cualquier barbero disponible.
+            ¿Para qué nueva fecha desea reprogramar su cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        lista_prestadores = ""
+
+        for i, prestador in enumerate(prestadores, start=1):
+            lista_prestadores += f"""
+            <Say language="es-MX">
+                {i}. {prestador.nombre}
+            </Say>
+            """
+
+        conversacion.paso = "REPROGRAMAR_PRESTADOR"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/reprogramar-prestador?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        <Say language="es-MX">
+            Seleccione uno de los siguientes barberos.
+        </Say>
+
+        {lista_prestadores}
+
+        <Say language="es-MX">
+            Presione en su teléfono el número del barbero que desea.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/reprogramar-tipo-prestador?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX">
+            No entendí su respuesta. Presione 1 o presione 2.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/reprogramar-prestador")
+async def reprogramar_prestador(
+    telefono: str,
+    Digits: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    telefono = telefono.replace("%2B", "+")
+    telefono = telefono.replace(" ", "")
+    telefono = telefono if telefono.startswith("+") else "+" + telefono
+
+    conversacion = (
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
+
+    prestadores = obtener_prestadores_compatibles(
+        db, conversacion.empresa_id, conversacion.servicio_id
+    )
+
+    opcion = Digits.strip()
+    prestador_seleccionado = None
+
+    if opcion.isdigit():
+        indice = int(opcion) - 1
+
+        if 0 <= indice < len(prestadores):
+            prestador_seleccionado = prestadores[indice]
+
+    if not prestador_seleccionado:
+        lista_prestadores = ""
+
+        for i, prestador in enumerate(prestadores, start=1):
+            lista_prestadores += f"""
+            <Say language="es-MX">
+                {i}. {prestador.nombre}
+            </Say>
+            """
+
+        twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/reprogramar-prestador?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        No encontré ese barbero. Por favor presione un número válido.
+
+        {lista_prestadores}
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    conversacion.prestador_id = prestador_seleccionado.id
+    conversacion.asignacion_automatica = False
+    conversacion.paso = "REPROGRAMAR_FECHA"
+
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/reprogramar-fecha?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX">
+            Perfecto, se atenderá con {prestador_seleccionado.nombre}.
+            ¿Para qué nueva fecha desea reprogramar su cita?
+        </Say>
+
+    </Gather>
 </Response>
 """
 
@@ -1184,24 +1902,61 @@ async def reprogramar_hora(
     """
         return Response(content=twiml, media_type="application/xml")
     
-    cita_ocupada = horario_choca_con_duracion(
-        db=db,
-        empresa_id=conversacion.empresa_id,
-        fecha=conversacion.fecha,
-        hora=hora,
-        servicio_id=conversacion.servicio_id,
-        cita_ignorar_id=cita_anterior.id,
-    )
+    prestador_final = conversacion.prestador_id
 
-    if cita_ocupada:
-        return respuesta_horario_ocupado()
-    
+    if empresa.usa_prestadores and conversacion.asignacion_automatica:
+        prestador_seleccionado = seleccionar_prestador_automaticamente(
+            db=db,
+            empresa_id=conversacion.empresa_id,
+            servicio_id=conversacion.servicio_id,
+            fecha=conversacion.fecha,
+            hora=hora,
+            cita_ignorar_id=cita_anterior.id,
+        )
+
+        if not prestador_seleccionado:
+            alternativas = obtener_horarios_disponibles(
+                db=db,
+                empresa=empresa,
+                fecha=conversacion.fecha,
+                servicio_id=conversacion.servicio_id,
+                cita_ignorar_id=cita_anterior.id,
+            )
+            return respuesta_sin_prestadores(alternativas)
+
+        prestador_final = prestador_seleccionado.id
+    else:
+        cita_ocupada = horario_choca_con_duracion(
+            db=db,
+            empresa_id=conversacion.empresa_id,
+            fecha=conversacion.fecha,
+            hora=hora,
+            servicio_id=conversacion.servicio_id,
+            prestador_id=prestador_final,
+            cita_ignorar_id=cita_anterior.id,
+        )
+
+        if cita_ocupada:
+            if prestador_final:
+                alternativas = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=conversacion.fecha,
+                    servicio_id=conversacion.servicio_id,
+                    prestador_id=prestador_final,
+                    cita_ignorar_id=cita_anterior.id,
+                )
+                return respuesta_prestador_ocupado(alternativas)
+
+            return respuesta_horario_ocupado()
+
     nueva_cita = reprogramar_cita(
         db=db,
         cita_anterior=cita_anterior,
         nueva_fecha=conversacion.fecha,
         nueva_hora=hora,
         canal="LLAMADA",
+        prestador_id=prestador_final,
     )
 
     db.delete(conversacion)
@@ -1339,24 +2094,62 @@ async def aclarar_hora_reprogramar(
     </Response>
     """
         return Response(content=twiml, media_type="application/xml")
-    cita_ocupada = horario_choca_con_duracion(
-        db=db,
-        empresa_id=conversacion.empresa_id,
-        fecha=conversacion.fecha,
-        hora=hora_final,
-        servicio_id=conversacion.servicio_id,
-        cita_ignorar_id=cita_anterior.id,
-    )
+    prestador_final = conversacion.prestador_id
 
-    if cita_ocupada:
-        return respuesta_horario_ocupado()
+    if empresa.usa_prestadores and conversacion.asignacion_automatica:
+        prestador_seleccionado = seleccionar_prestador_automaticamente(
+            db=db,
+            empresa_id=conversacion.empresa_id,
+            servicio_id=conversacion.servicio_id,
+            fecha=conversacion.fecha,
+            hora=hora_final,
+            cita_ignorar_id=cita_anterior.id,
+        )
+
+        if not prestador_seleccionado:
+            alternativas = obtener_horarios_disponibles(
+                db=db,
+                empresa=empresa,
+                fecha=conversacion.fecha,
+                servicio_id=conversacion.servicio_id,
+                cita_ignorar_id=cita_anterior.id,
+            )
+            return respuesta_sin_prestadores(alternativas)
+
+        prestador_final = prestador_seleccionado.id
+    else:
+        cita_ocupada = horario_choca_con_duracion(
+            db=db,
+            empresa_id=conversacion.empresa_id,
+            fecha=conversacion.fecha,
+            hora=hora_final,
+            servicio_id=conversacion.servicio_id,
+            prestador_id=prestador_final,
+            cita_ignorar_id=cita_anterior.id,
+        )
+
+        if cita_ocupada:
+            if prestador_final:
+                alternativas = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=conversacion.fecha,
+                    servicio_id=conversacion.servicio_id,
+                    prestador_id=prestador_final,
+                    cita_ignorar_id=cita_anterior.id,
+                )
+                return respuesta_prestador_ocupado(alternativas)
+
+            return respuesta_horario_ocupado()
+
     nueva_cita = reprogramar_cita(
         db=db,
         cita_anterior=cita_anterior,
         nueva_fecha=conversacion.fecha,
         nueva_hora=hora_final,
         canal="LLAMADA",
-)
+        prestador_id=prestador_final,
+    )
     db.delete(conversacion)
     db.commit()
     twiml = f"""

@@ -9,6 +9,7 @@ from app.routers.auth import router as auth_router
 from app.routers.usuarios import router as usuarios_router
 from app.routers.servicios import router as servicios_router
 from app.routers.whatsapp import router as whatsapp_router
+from app.routers.prestadores import router as prestadores_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -32,6 +33,7 @@ app.include_router(servicios_router)
 app.include_router(citas_router)
 app.include_router(llamadas_router)
 app.include_router(whatsapp_router)
+app.include_router(prestadores_router)
 
 
 @app.get("/")

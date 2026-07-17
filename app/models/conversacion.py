@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey, Boolean
 from app.database import Base
 
 
@@ -21,3 +21,10 @@ class Conversacion(Base):
     fecha = Column(String, nullable=True)
     hora = Column(String, nullable=True)
     servicio_id = Column(Integer, ForeignKey("servicios.id"), nullable=True)
+    prestador_id = Column(Integer, ForeignKey("prestadores.id"), nullable=True)
+
+    asignacion_automatica = Column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )

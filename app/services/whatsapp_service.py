@@ -43,6 +43,58 @@ def enviar_mensaje_whatsapp(
 
     return response.json()
 
+
+def enviar_lista_whatsapp(
+    phone_number_id: str,
+    token: str,
+    telefono_cliente: str,
+    texto: str,
+    boton_texto: str,
+    filas: list[dict],
+):
+    telefono_cliente = normalizar_destinatario_meta(telefono_cliente)
+
+    url = f"https://graph.facebook.com/v21.0/{phone_number_id}/messages"
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": telefono_cliente,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {
+                "text": texto
+            },
+            "action": {
+                "button": boton_texto,
+                "sections": [
+                    {
+                        "title": "Opciones",
+                        "rows": [
+                            {
+                                "id": fila["id"],
+                                "title": fila["title"],
+                            }
+                            for fila in filas
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+
+    print("META STATUS:", response.status_code)
+    print("META RESPONSE:", response.text)
+
+    return response.json()
+
 def enviar_botones_whatsapp(
     phone_number_id: str,
     token: str,

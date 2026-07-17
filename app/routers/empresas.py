@@ -44,6 +44,7 @@ def crear_empresa(
     telefono_twilio: str,
     horario_inicio: str = "09:00",
     horario_fin: str = "18:00",
+    usa_prestadores: bool = False,
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
 ):
@@ -63,11 +64,28 @@ def crear_empresa(
         telefono_twilio=telefono_twilio,
         horario_inicio=horario_inicio,
         horario_fin=horario_fin,
+        usa_prestadores=usa_prestadores,
     )
 
     db.add(empresa)
     db.commit()
     db.refresh(empresa)
+
+    return empresa
+
+
+@router.get("/empresas/{empresa_id}")
+def obtener_empresa(
+    empresa_id: int,
+    db: Session = Depends(get_db),
+    usuario_actual: dict = Depends(obtener_usuario_actual),
+):
+    validar_acceso_empresa(empresa_id, usuario_actual)
+
+    empresa = db.query(Empresa).filter(Empresa.id == empresa_id).first()
+
+    if not empresa:
+        raise HTTPException(status_code=404, detail="Empresa no encontrada")
 
     return empresa
 
@@ -136,6 +154,7 @@ def editar_empresa(
     horario_inicio: str = "09:00",
     horario_fin: str = "18:00",
     activa: bool = True,
+    usa_prestadores: bool = False,
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
 ):
@@ -163,6 +182,7 @@ def editar_empresa(
     empresa.horario_inicio = horario_inicio
     empresa.horario_fin = horario_fin
     empresa.activa = activa
+    empresa.usa_prestadores = usa_prestadores
 
     db.commit()
     db.refresh(empresa)

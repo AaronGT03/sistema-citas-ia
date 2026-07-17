@@ -2,10 +2,11 @@ from fastapi import APIRouter, Request, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import NumeroWhatsApp, Empresa, Conversacion, Servicio, Cita
+from app.models import NumeroWhatsApp, Empresa, Conversacion, Servicio, Cita, Prestador
 from app.services.whatsapp_service import (
     enviar_mensaje_whatsapp,
     enviar_botones_whatsapp,
+    enviar_lista_whatsapp,
 )
 from app.services.citas_service import (
     crear_cita,
@@ -16,11 +17,15 @@ from app.services.citas_service import (
     fecha_ya_paso,
     hora_ya_paso,
     horario_choca_con_duracion,
+    obtener_prestadores_compatibles,
+    seleccionar_prestador_automaticamente,
 )
 from app.utils import normalizar_fecha, normalizar_hora, normalizar_telefono_mexico
 from app.core.config import META_VERIFY_TOKEN
 
 router = APIRouter(tags=["WhatsApp"])
+
+_SIN_VALOR = object()
 
 
 @router.get("/webhook-whatsapp")
@@ -67,6 +72,8 @@ def limpiar_flujos_activos(db: Session, empresa_id: int, telefono_cliente: str):
         flujo.fecha = None
         flujo.hora = None
         flujo.servicio_id = None
+        flujo.prestador_id = None
+        flujo.asignacion_automatica = False
         flujo.mensaje = None
         flujo.respuesta = None
         db.commit()
@@ -83,6 +90,8 @@ def guardar_conversacion(
     fecha: str | None = None,
     hora: str | None = None,
     servicio_id: int | None = None,
+    prestador_id=_SIN_VALOR,
+    asignacion_automatica=_SIN_VALOR,
 ):
     flujo = (
         db.query(Conversacion)
@@ -95,12 +104,23 @@ def guardar_conversacion(
         .first()
     )
 
+    # prestador_id/asignacion_automatica no se piden en cada paso del flujo
+    # (a diferencia de nombre/fecha/hora/servicio_id); si no se pasan
+    # explícitamente se conserva lo que ya tenía la conversación.
+    if prestador_id is _SIN_VALOR:
+        prestador_id = flujo.prestador_id if flujo else None
+
+    if asignacion_automatica is _SIN_VALOR:
+        asignacion_automatica = flujo.asignacion_automatica if flujo else False
+
     if flujo:
         flujo.paso = paso
         flujo.nombre = nombre
         flujo.fecha = fecha
         flujo.hora = hora
         flujo.servicio_id = servicio_id
+        flujo.prestador_id = prestador_id
+        flujo.asignacion_automatica = asignacion_automatica
 
         # Ya no guardamos mensajes ni respuestas
         flujo.mensaje = None
@@ -125,6 +145,8 @@ def guardar_conversacion(
         fecha=fecha,
         hora=hora,
         servicio_id=servicio_id,
+        prestador_id=prestador_id,
+        asignacion_automatica=asignacion_automatica,
     )
 
     db.add(flujo)
@@ -209,6 +231,8 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
             if "button_reply" in interactive:
                 mensaje = interactive["button_reply"]["id"]
+            elif "list_reply" in interactive:
+                mensaje = interactive["list_reply"]["id"]
             else:
                 mensaje = ""
 
@@ -387,13 +411,34 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
             if not cita:
                 respuesta = "No encontré ninguna cita activa para reprogramar."
-            else:
-                respuesta = (
-                    "Encontré tu cita actual:\n\n"
-                    f"Fecha: {cita.fecha}\n"
-                    f"Hora: {cita.hora}\n\n"
-                    "¿Qué nueva fecha deseas?"
-                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "REPROGRAMAR_FECHA"}
+
+            if empresa.usa_prestadores:
+                if cita.prestador_id:
+                    respuesta = (
+                        "Encontré tu cita actual:\n\n"
+                        f"Fecha: {cita.fecha}\n"
+                        f"Hora: {cita.hora}\n\n"
+                        "¿Deseas mantener a tu mismo barbero o elegir otro?"
+                    )
+                    botones = [
+                        {"id": "MISMO_PRESTADOR", "title": "Mismo barbero"},
+                        {"id": "ELEGIR_PRESTADOR", "title": "Elegir otro"},
+                    ]
+                else:
+                    respuesta = (
+                        "Encontré tu cita actual:\n\n"
+                        f"Fecha: {cita.fecha}\n"
+                        f"Hora: {cita.hora}\n\n"
+                        "¿Deseas atenderte con un barbero específico o con "
+                        "cualquiera disponible?"
+                    )
+                    botones = [
+                        {"id": "ELEGIR_PRESTADOR", "title": "Elegir barbero"},
+                        {"id": "CUALQUIER_PRESTADOR", "title": "Cualquier barbero"},
+                    ]
 
                 guardar_conversacion(
                     db=db,
@@ -401,12 +446,43 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     telefono_cliente=telefono_cliente,
                     mensaje=mensaje,
                     respuesta=respuesta,
-                    paso="REPROGRAMAR_FECHA",
+                    paso="REPROGRAMAR_TIPO_PRESTADOR",
                     nombre=cita.nombre,
                     fecha=cita.fecha,
                     hora=cita.hora,
                     servicio_id=cita.servicio_id,
+                    prestador_id=cita.prestador_id,
                 )
+
+                enviar_botones_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto=respuesta,
+                    botones=botones,
+                )
+
+                return {"status": "REPROGRAMAR_TIPO_PRESTADOR"}
+
+            respuesta = (
+                "Encontré tu cita actual:\n\n"
+                f"Fecha: {cita.fecha}\n"
+                f"Hora: {cita.hora}\n\n"
+                "¿Qué nueva fecha deseas?"
+            )
+
+            guardar_conversacion(
+                db=db,
+                empresa_id=empresa.id,
+                telefono_cliente=telefono_cliente,
+                mensaje=mensaje,
+                respuesta=respuesta,
+                paso="REPROGRAMAR_FECHA",
+                nombre=cita.nombre,
+                fecha=cita.fecha,
+                hora=cita.hora,
+                servicio_id=cita.servicio_id,
+            )
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "REPROGRAMAR_FECHA"}
@@ -508,6 +584,182 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 telefono_cliente=telefono_cliente,
             )
             return {"status": "CANCELACION_PROCESADA"}
+
+        # =========================
+        # REPROGRAMAR TIPO PRESTADOR
+        # =========================
+        if flujo and flujo.paso == "REPROGRAMAR_TIPO_PRESTADOR":
+            if mensaje == "MISMO_PRESTADOR" and flujo.prestador_id:
+                respuesta = "Perfecto. ¿Para qué nueva fecha deseas reprogramar tu cita?"
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="REPROGRAMAR_FECHA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    hora=flujo.hora,
+                    servicio_id=flujo.servicio_id,
+                    prestador_id=flujo.prestador_id,
+                    asignacion_automatica=False,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "REPROGRAMAR_FECHA"}
+
+            if mensaje == "CUALQUIER_PRESTADOR" and not flujo.prestador_id:
+                respuesta = (
+                    "Perfecto, te atenderá cualquier barbero disponible.\n\n"
+                    "¿Para qué nueva fecha deseas reprogramar tu cita?"
+                )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="REPROGRAMAR_FECHA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    hora=flujo.hora,
+                    servicio_id=flujo.servicio_id,
+                    prestador_id=None,
+                    asignacion_automatica=True,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "REPROGRAMAR_FECHA"}
+
+            if mensaje == "ELEGIR_PRESTADOR":
+                prestadores = obtener_prestadores_compatibles(
+                    db, empresa.id, flujo.servicio_id
+                )
+
+                if not prestadores:
+                    respuesta = (
+                        "Por el momento no hay barberos específicos disponibles "
+                        "para ese servicio. Te atenderá cualquier barbero "
+                        "disponible.\n\n¿Para qué nueva fecha deseas reprogramar "
+                        "tu cita?"
+                    )
+
+                    guardar_conversacion(
+                        db=db,
+                        empresa_id=empresa.id,
+                        telefono_cliente=telefono_cliente,
+                        mensaje=mensaje,
+                        respuesta=respuesta,
+                        paso="REPROGRAMAR_FECHA",
+                        nombre=flujo.nombre,
+                        fecha=flujo.fecha,
+                        hora=flujo.hora,
+                        servicio_id=flujo.servicio_id,
+                        prestador_id=None,
+                        asignacion_automatica=True,
+                    )
+
+                    enviar_respuesta(numero, telefono_cliente, respuesta)
+                    return {"status": "REPROGRAMAR_FECHA"}
+
+                filas = [
+                    {"id": f"PRESTADOR_{prestador.id}", "title": prestador.nombre}
+                    for prestador in prestadores
+                ]
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta="Selecciona un barbero",
+                    paso="REPROGRAMAR_PRESTADOR",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    hora=flujo.hora,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_lista_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto="Selecciona el barbero con el que deseas atenderte:",
+                    boton_texto="Ver barberos",
+                    filas=filas,
+                )
+
+                return {"status": "REPROGRAMAR_PRESTADOR"}
+
+            respuesta = "No entendí tu respuesta. Por favor selecciona una opción."
+
+            enviar_respuesta(numero, telefono_cliente, respuesta)
+            return {"status": "REPROGRAMAR_TIPO_PRESTADOR"}
+
+        # =========================
+        # REPROGRAMAR PRESTADOR
+        # =========================
+        if flujo and flujo.paso == "REPROGRAMAR_PRESTADOR":
+            prestadores = obtener_prestadores_compatibles(
+                db, empresa.id, flujo.servicio_id
+            )
+
+            prestador_seleccionado = None
+
+            if mensaje.startswith("PRESTADOR_"):
+                try:
+                    prestador_id_elegido = int(mensaje.replace("PRESTADOR_", ""))
+                except ValueError:
+                    prestador_id_elegido = None
+
+                prestador_seleccionado = next(
+                    (p for p in prestadores if p.id == prestador_id_elegido), None
+                )
+
+            if not prestador_seleccionado:
+                respuesta = "No reconocí ese barbero. Por favor selecciónalo de la lista."
+
+                filas = [
+                    {"id": f"PRESTADOR_{prestador.id}", "title": prestador.nombre}
+                    for prestador in prestadores
+                ]
+
+                enviar_lista_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto=respuesta,
+                    boton_texto="Ver barberos",
+                    filas=filas,
+                )
+
+                return {"status": "REPROGRAMAR_PRESTADOR"}
+
+            respuesta = (
+                f"Perfecto, te atenderá {prestador_seleccionado.nombre}.\n\n"
+                "¿Para qué nueva fecha deseas reprogramar tu cita?"
+            )
+
+            guardar_conversacion(
+                db=db,
+                empresa_id=empresa.id,
+                telefono_cliente=telefono_cliente,
+                mensaje=mensaje,
+                respuesta=respuesta,
+                paso="REPROGRAMAR_FECHA",
+                nombre=flujo.nombre,
+                fecha=flujo.fecha,
+                hora=flujo.hora,
+                servicio_id=flujo.servicio_id,
+                prestador_id=prestador_seleccionado.id,
+                asignacion_automatica=False,
+            )
+
+            enviar_respuesta(numero, telefono_cliente, respuesta)
+            return {"status": "REPROGRAMAR_FECHA"}
 
         # =========================
         # REPROGRAMAR FECHA
@@ -680,24 +932,57 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "HORARIO_FUERA_DE_RANGO"}
 
-            cita_ocupada = horario_choca_con_duracion(
-                db=db,
-                empresa_id=empresa.id,
-                fecha=flujo.fecha,
-                hora=nueva_hora,
-                servicio_id=flujo.servicio_id,
-                cita_ignorar_id=cita_activa.id,
-            )
+            prestador_final = flujo.prestador_id
+            horarios_alternativos = None
 
-            if cita_ocupada:
-                horarios = obtener_horarios_disponibles(
+            if empresa.usa_prestadores and flujo.asignacion_automatica:
+                prestador_seleccionado = seleccionar_prestador_automaticamente(
                     db=db,
-                    empresa=empresa,
+                    empresa_id=empresa.id,
+                    servicio_id=flujo.servicio_id,
                     fecha=flujo.fecha,
+                    hora=nueva_hora,
+                    cita_ignorar_id=cita_activa.id,
                 )
 
-                if horarios:
-                    lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+                if not prestador_seleccionado:
+                    horarios_alternativos = obtener_horarios_disponibles(
+                        db=db,
+                        empresa=empresa,
+                        fecha=flujo.fecha,
+                        servicio_id=flujo.servicio_id,
+                        cita_ignorar_id=cita_activa.id,
+                    )
+                    cita_ocupada = True
+                else:
+                    prestador_final = prestador_seleccionado.id
+                    cita_ocupada = False
+            else:
+                cita_ocupada = horario_choca_con_duracion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    fecha=flujo.fecha,
+                    hora=nueva_hora,
+                    servicio_id=flujo.servicio_id,
+                    prestador_id=prestador_final,
+                    cita_ignorar_id=cita_activa.id,
+                )
+
+                if cita_ocupada:
+                    horarios_alternativos = obtener_horarios_disponibles(
+                        db=db,
+                        empresa=empresa,
+                        fecha=flujo.fecha,
+                        servicio_id=flujo.servicio_id,
+                        prestador_id=prestador_final,
+                        cita_ignorar_id=cita_activa.id,
+                    )
+
+            if cita_ocupada:
+                if horarios_alternativos:
+                    lista_horarios = "\n".join(
+                        [f"- {h}" for h in horarios_alternativos[:5]]
+                    )
 
                     respuesta = (
                         "Ese horario ya está ocupado.\n\n"
@@ -733,6 +1018,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     nueva_fecha=flujo.fecha,
                     nueva_hora=nueva_hora,
                     canal="WHATSAPP",
+                    prestador_id=prestador_final,
                 )
 
                 respuesta = (
@@ -866,24 +1152,57 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 return {"status": "SIN_CITA_ACTIVA"}
 
             else:
-                cita_ocupada = horario_choca_con_duracion(
-                    db=db,
-                    empresa_id=empresa.id,
-                    fecha=flujo.fecha,
-                    hora=nueva_hora,
-                    servicio_id=flujo.servicio_id,
-                    cita_ignorar_id=cita_activa.id,
-                )
+                prestador_final = flujo.prestador_id
+                horarios_alternativos = None
 
-                if cita_ocupada:
-                    horarios = obtener_horarios_disponibles(
+                if empresa.usa_prestadores and flujo.asignacion_automatica:
+                    prestador_seleccionado = seleccionar_prestador_automaticamente(
                         db=db,
-                        empresa=empresa,
+                        empresa_id=empresa.id,
+                        servicio_id=flujo.servicio_id,
                         fecha=flujo.fecha,
+                        hora=nueva_hora,
+                        cita_ignorar_id=cita_activa.id,
                     )
 
-                    if horarios:
-                        lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+                    if not prestador_seleccionado:
+                        horarios_alternativos = obtener_horarios_disponibles(
+                            db=db,
+                            empresa=empresa,
+                            fecha=flujo.fecha,
+                            servicio_id=flujo.servicio_id,
+                            cita_ignorar_id=cita_activa.id,
+                        )
+                        cita_ocupada = True
+                    else:
+                        prestador_final = prestador_seleccionado.id
+                        cita_ocupada = False
+                else:
+                    cita_ocupada = horario_choca_con_duracion(
+                        db=db,
+                        empresa_id=empresa.id,
+                        fecha=flujo.fecha,
+                        hora=nueva_hora,
+                        servicio_id=flujo.servicio_id,
+                        prestador_id=prestador_final,
+                        cita_ignorar_id=cita_activa.id,
+                    )
+
+                    if cita_ocupada:
+                        horarios_alternativos = obtener_horarios_disponibles(
+                            db=db,
+                            empresa=empresa,
+                            fecha=flujo.fecha,
+                            servicio_id=flujo.servicio_id,
+                            prestador_id=prestador_final,
+                            cita_ignorar_id=cita_activa.id,
+                        )
+
+                if cita_ocupada:
+                    if horarios_alternativos:
+                        lista_horarios = "\n".join(
+                            [f"- {h}" for h in horarios_alternativos[:5]]
+                        )
 
                         respuesta = (
                             "Ese horario ya está ocupado.\n\n"
@@ -918,6 +1237,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     nueva_fecha=flujo.fecha,
                     nueva_hora=nueva_hora,
                     canal="WHATSAPP",
+                    prestador_id=prestador_final,
                 )
 
                 respuesta = (
@@ -970,6 +1290,37 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     respuesta=respuesta,
                     paso="PEDIR_SERVICIO",
                 )
+            elif empresa.usa_prestadores:
+                respuesta = (
+                    f"Perfecto, seleccionaste {servicio_seleccionado.nombre}.\n\n"
+                    "¿Deseas atenderte con un barbero específico o con cualquiera "
+                    "disponible?"
+                )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_TIPO_PRESTADOR",
+                    servicio_id=servicio_seleccionado.id,
+                    prestador_id=None,
+                    asignacion_automatica=False,
+                )
+
+                enviar_botones_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto=respuesta,
+                    botones=[
+                        {"id": "ELEGIR_PRESTADOR", "title": "Elegir barbero"},
+                        {"id": "CUALQUIER_PRESTADOR", "title": "Cualquier barbero"},
+                    ],
+                )
+
+                return {"status": "PEDIR_TIPO_PRESTADOR"}
             else:
                 respuesta = (
                     f"Perfecto, seleccionaste {servicio_seleccionado.nombre}.\n\n"
@@ -986,6 +1337,161 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     servicio_id=servicio_seleccionado.id,
                 )
 
+
+            enviar_respuesta(numero, telefono_cliente, respuesta)
+            return {"status": "PEDIR_NOMBRE"}
+
+        # =========================
+        # PEDIR TIPO PRESTADOR
+        # =========================
+        if flujo and flujo.paso == "PEDIR_TIPO_PRESTADOR":
+            if mensaje == "CUALQUIER_PRESTADOR":
+                respuesta = (
+                    "Perfecto, te atenderá cualquier barbero disponible.\n\n"
+                    "¿Cuál es tu nombre completo?"
+                )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_NOMBRE",
+                    servicio_id=flujo.servicio_id,
+                    prestador_id=None,
+                    asignacion_automatica=True,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "PEDIR_NOMBRE"}
+
+            if mensaje == "ELEGIR_PRESTADOR":
+                prestadores = obtener_prestadores_compatibles(
+                    db, empresa.id, flujo.servicio_id
+                )
+
+                if not prestadores:
+                    respuesta = (
+                        "Por el momento no hay barberos específicos disponibles "
+                        "para ese servicio. Te atenderá cualquier barbero "
+                        "disponible.\n\n¿Cuál es tu nombre completo?"
+                    )
+
+                    guardar_conversacion(
+                        db=db,
+                        empresa_id=empresa.id,
+                        telefono_cliente=telefono_cliente,
+                        mensaje=mensaje,
+                        respuesta=respuesta,
+                        paso="PEDIR_NOMBRE",
+                        servicio_id=flujo.servicio_id,
+                        prestador_id=None,
+                        asignacion_automatica=True,
+                    )
+
+                    enviar_respuesta(numero, telefono_cliente, respuesta)
+                    return {"status": "PEDIR_NOMBRE"}
+
+                filas = [
+                    {"id": f"PRESTADOR_{prestador.id}", "title": prestador.nombre}
+                    for prestador in prestadores
+                ]
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta="Selecciona un barbero",
+                    paso="PEDIR_PRESTADOR",
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_lista_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto="Selecciona el barbero con el que deseas atenderte:",
+                    boton_texto="Ver barberos",
+                    filas=filas,
+                )
+
+                return {"status": "PEDIR_PRESTADOR"}
+
+            respuesta = (
+                "¿Deseas atenderte con un barbero específico o con cualquiera "
+                "disponible?"
+            )
+
+            enviar_botones_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                texto=respuesta,
+                botones=[
+                    {"id": "ELEGIR_PRESTADOR", "title": "Elegir barbero"},
+                    {"id": "CUALQUIER_PRESTADOR", "title": "Cualquier barbero"},
+                ],
+            )
+
+            return {"status": "PEDIR_TIPO_PRESTADOR"}
+
+        # =========================
+        # PEDIR PRESTADOR
+        # =========================
+        if flujo and flujo.paso == "PEDIR_PRESTADOR":
+            prestadores = obtener_prestadores_compatibles(
+                db, empresa.id, flujo.servicio_id
+            )
+
+            prestador_seleccionado = None
+
+            if mensaje.startswith("PRESTADOR_"):
+                try:
+                    prestador_id_elegido = int(mensaje.replace("PRESTADOR_", ""))
+                except ValueError:
+                    prestador_id_elegido = None
+
+                prestador_seleccionado = next(
+                    (p for p in prestadores if p.id == prestador_id_elegido), None
+                )
+
+            if not prestador_seleccionado:
+                respuesta = "No reconocí ese barbero. Por favor selecciónalo de la lista."
+
+                filas = [
+                    {"id": f"PRESTADOR_{prestador.id}", "title": prestador.nombre}
+                    for prestador in prestadores
+                ]
+
+                enviar_lista_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto=respuesta,
+                    boton_texto="Ver barberos",
+                    filas=filas,
+                )
+
+                return {"status": "PEDIR_PRESTADOR"}
+
+            respuesta = (
+                f"Perfecto, te atenderá {prestador_seleccionado.nombre}.\n\n"
+                "¿Cuál es tu nombre completo?"
+            )
+
+            guardar_conversacion(
+                db=db,
+                empresa_id=empresa.id,
+                telefono_cliente=telefono_cliente,
+                mensaje=mensaje,
+                respuesta=respuesta,
+                paso="PEDIR_NOMBRE",
+                servicio_id=flujo.servicio_id,
+                prestador_id=prestador_seleccionado.id,
+                asignacion_automatica=False,
+            )
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "PEDIR_NOMBRE"}
@@ -1175,25 +1681,71 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
             print("FECHA:", flujo.fecha)
             print("HORA:", hora)
 
-            cita_ocupada = horario_choca_con_duracion(
-                db=db,
-                empresa_id=empresa.id,
-                fecha=flujo.fecha,
-                hora=hora,
-                servicio_id=flujo.servicio_id,
-            )
+            prestador_final = None
+            horarios_alternativos = None
 
-            print("CITA OCUPADA:", cita_ocupada.id if cita_ocupada else None)
+            if empresa.usa_prestadores:
+                if flujo.prestador_id:
+                    cita_ocupada = horario_choca_con_duracion(
+                        db=db,
+                        empresa_id=empresa.id,
+                        fecha=flujo.fecha,
+                        hora=hora,
+                        servicio_id=flujo.servicio_id,
+                        prestador_id=flujo.prestador_id,
+                    )
 
-            if cita_ocupada:
-                horarios = obtener_horarios_disponibles(
+                    if cita_ocupada:
+                        horarios_alternativos = obtener_horarios_disponibles(
+                            db=db,
+                            empresa=empresa,
+                            fecha=flujo.fecha,
+                            servicio_id=flujo.servicio_id,
+                            prestador_id=flujo.prestador_id,
+                        )
+                    else:
+                        prestador_final = flujo.prestador_id
+                else:
+                    prestador_seleccionado = seleccionar_prestador_automaticamente(
+                        db=db,
+                        empresa_id=empresa.id,
+                        servicio_id=flujo.servicio_id,
+                        fecha=flujo.fecha,
+                        hora=hora,
+                    )
+
+                    if not prestador_seleccionado:
+                        horarios_alternativos = obtener_horarios_disponibles(
+                            db=db,
+                            empresa=empresa,
+                            fecha=flujo.fecha,
+                            servicio_id=flujo.servicio_id,
+                        )
+                        cita_ocupada = True
+                    else:
+                        prestador_final = prestador_seleccionado.id
+                        cita_ocupada = False
+            else:
+                cita_ocupada = horario_choca_con_duracion(
                     db=db,
-                    empresa=empresa,
+                    empresa_id=empresa.id,
                     fecha=flujo.fecha,
+                    hora=hora,
+                    servicio_id=flujo.servicio_id,
                 )
 
-                if horarios:
-                    lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+                if cita_ocupada:
+                    horarios_alternativos = obtener_horarios_disponibles(
+                        db=db,
+                        empresa=empresa,
+                        fecha=flujo.fecha,
+                    )
+
+            if cita_ocupada:
+                if horarios_alternativos:
+                    lista_horarios = "\n".join(
+                        [f"- {h}" for h in horarios_alternativos[:5]]
+                    )
 
                     respuesta = (
                         "Ese horario ya está ocupado.\n\n"
@@ -1231,6 +1783,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 empresa_id=empresa.id,
                 servicio_id=flujo.servicio_id,
                 canal="WHATSAPP",
+                prestador_id=prestador_final,
             )
 
             servicio = (
@@ -1347,23 +1900,71 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "HORARIO_FUERA_DE_RANGO"}
 
-            cita_ocupada = horario_choca_con_duracion(
-                db=db,
-                empresa_id=empresa.id,
-                fecha=flujo.fecha,
-                hora=hora,
-                servicio_id=flujo.servicio_id,
-            )
+            prestador_final = None
+            horarios_alternativos = None
 
-            if cita_ocupada:
-                horarios = obtener_horarios_disponibles(
+            if empresa.usa_prestadores:
+                if flujo.prestador_id:
+                    cita_ocupada = horario_choca_con_duracion(
+                        db=db,
+                        empresa_id=empresa.id,
+                        fecha=flujo.fecha,
+                        hora=hora,
+                        servicio_id=flujo.servicio_id,
+                        prestador_id=flujo.prestador_id,
+                    )
+
+                    if cita_ocupada:
+                        horarios_alternativos = obtener_horarios_disponibles(
+                            db=db,
+                            empresa=empresa,
+                            fecha=flujo.fecha,
+                            servicio_id=flujo.servicio_id,
+                            prestador_id=flujo.prestador_id,
+                        )
+                    else:
+                        prestador_final = flujo.prestador_id
+                else:
+                    prestador_seleccionado = seleccionar_prestador_automaticamente(
+                        db=db,
+                        empresa_id=empresa.id,
+                        servicio_id=flujo.servicio_id,
+                        fecha=flujo.fecha,
+                        hora=hora,
+                    )
+
+                    if not prestador_seleccionado:
+                        horarios_alternativos = obtener_horarios_disponibles(
+                            db=db,
+                            empresa=empresa,
+                            fecha=flujo.fecha,
+                            servicio_id=flujo.servicio_id,
+                        )
+                        cita_ocupada = True
+                    else:
+                        prestador_final = prestador_seleccionado.id
+                        cita_ocupada = False
+            else:
+                cita_ocupada = horario_choca_con_duracion(
                     db=db,
-                    empresa=empresa,
+                    empresa_id=empresa.id,
                     fecha=flujo.fecha,
+                    hora=hora,
+                    servicio_id=flujo.servicio_id,
                 )
 
-                if horarios:
-                    lista_horarios = "\n".join([f"- {h}" for h in horarios[:5]])
+                if cita_ocupada:
+                    horarios_alternativos = obtener_horarios_disponibles(
+                        db=db,
+                        empresa=empresa,
+                        fecha=flujo.fecha,
+                    )
+
+            if cita_ocupada:
+                if horarios_alternativos:
+                    lista_horarios = "\n".join(
+                        [f"- {h}" for h in horarios_alternativos[:5]]
+                    )
 
                     respuesta = (
                         "Ese horario ya está ocupado.\n\n"
@@ -1401,6 +2002,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 empresa_id=empresa.id,
                 servicio_id=flujo.servicio_id,
                 canal="WHATSAPP",
+                prestador_id=prestador_final,
             )
 
             respuesta = (
