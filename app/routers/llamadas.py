@@ -4,7 +4,7 @@ from fastapi.responses import Response
 
 from app.database import get_db
 from app.models import Cita, Conversacion, Empresa, Servicio, Prestador
-from app.utils import normalizar_fecha, normalizar_hora
+from app.utils import normalizar_fecha, normalizar_hora, normalizar_telefono_mexico
 from app.services.citas_service import (
     existe_cita_en_horario,
     crear_cita,
@@ -49,7 +49,7 @@ def respuesta_prestador_ocupado(alternativas=None):
     twiml = f"""
 <Response>
     <Say language="es-MX">
-        Ese barbero no está disponible en ese horario.
+        Ese profesional no está disponible en ese horario.
     </Say>
 {mensaje_alternativas}
 </Response>
@@ -72,7 +72,7 @@ def respuesta_sin_prestadores(alternativas=None):
     twiml = f"""
 <Response>
     <Say language="es-MX">
-        No hay barberos disponibles en ese horario.
+        No hay profesionales disponibles en ese horario.
     </Say>
 {mensaje_alternativas}
 </Response>
@@ -87,10 +87,10 @@ async def llamada(
     print(f"Llamada recibida de: {From}")
     print(f"Número Twilio recibido: {To}")
 
-    telefono_cliente = From.replace(" ", "")
+    telefono_cliente = normalizar_telefono_mexico(From)
     telefono_empresa = To.replace(" ", "")
 
-    telefono_url = telefono_cliente.replace("+", "%2B")
+    telefono_url = telefono_cliente
 
     empresa = (
         db.query(Empresa).filter(Empresa.telefono_twilio == telefono_empresa).first()
@@ -181,9 +181,7 @@ async def procesar_cita(
     SpeechResult: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     respuesta = SpeechResult.lower().strip()
     print("RESPUESTA DETECTADA:")
@@ -255,16 +253,16 @@ async def procesar_cita(
             if cita.prestador_id:
                 mensaje_opciones = """
         <Say language="es-MX">
-            Presione 1 para mantener a su mismo barbero.
-            Presione 2 para elegir otro barbero.
+            Presione 1 para mantener a su mismo profesional.
+            Presione 2 para elegir otro profesional.
         </Say>
 """
             else:
                 mensaje_opciones = """
         <Say language="es-MX">
-            ¿Desea atenderse con un barbero específico?
-            Presione 1 para elegir un barbero.
-            Presione 2 para atenderse con cualquier barbero disponible.
+            ¿Desea atenderse con un profesional específico?
+            Presione 1 para elegir un profesional.
+            Presione 2 para atenderse con cualquier profesional disponible.
         </Say>
 """
 
@@ -321,9 +319,7 @@ async def procesar_agenda(
     SpeechResult: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     print("ENTRO A PROCESAR_AGENDA")
     print(f"SpeechResult RAW: [{SpeechResult}]")
@@ -412,9 +408,7 @@ async def procesar_agenda(
 async def guardar_nombre(
     telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     nombre = SpeechResult.strip()
 
@@ -474,9 +468,7 @@ async def guardar_servicio(
     Digits: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     opcion = Digits.strip()
     conversacion = (
@@ -559,9 +551,9 @@ async def guardar_servicio(
         </Say>
 
         <Say language="es-MX">
-            ¿Desea atenderse con un barbero específico?
-            Presione 1 para elegir un barbero.
-            Presione 2 para atenderse con cualquier barbero disponible.
+            ¿Desea atenderse con un profesional específico?
+            Presione 1 para elegir un profesional.
+            Presione 2 para atenderse con cualquier profesional disponible.
         </Say>
 
     </Gather>
@@ -606,9 +598,7 @@ async def guardar_tipo_prestador(
     Digits: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     conversacion = (
         db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
@@ -645,7 +635,7 @@ async def guardar_tipo_prestador(
         speechTimeout="auto">
 
         <Say language="es-MX">
-            Perfecto, se atenderá con cualquier barbero disponible.
+            Perfecto, se atenderá con cualquier profesional disponible.
             ¿Cuál es su nombre completo?
         </Say>
 
@@ -680,8 +670,8 @@ async def guardar_tipo_prestador(
         speechTimeout="auto">
 
         <Say language="es-MX">
-            Por el momento no hay barberos específicos disponibles para ese servicio.
-            Le atenderá cualquier barbero disponible.
+            Por el momento no hay profesionales específicos disponibles para ese servicio.
+            Le atenderá cualquier profesional disponible.
             ¿Cuál es su nombre completo?
         </Say>
 
@@ -712,13 +702,13 @@ async def guardar_tipo_prestador(
     timeout="10">
 
         <Say language="es-MX">
-            Seleccione uno de los siguientes barberos.
+            Seleccione uno de los siguientes profesionales.
         </Say>
 
         {lista_prestadores}
 
         <Say language="es-MX">
-            Presione en su teléfono el número del barbero que desea.
+            Presione en su teléfono el número del profesional que desea.
         </Say>
 
     </Gather>
@@ -737,8 +727,8 @@ async def guardar_tipo_prestador(
 
         <Say language="es-MX">
             No entendí su respuesta.
-            Presione 1 para elegir un barbero.
-            Presione 2 para atenderse con cualquier barbero disponible.
+            Presione 1 para elegir un profesional.
+            Presione 2 para atenderse con cualquier profesional disponible.
         </Say>
 
     </Gather>
@@ -753,9 +743,7 @@ async def guardar_prestador(
     Digits: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     conversacion = (
         db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
@@ -805,7 +793,7 @@ async def guardar_prestador(
     method="POST"
     timeout="10">
 
-        No encontré ese barbero. Por favor presione un número válido.
+        No encontré ese profesional. Por favor presione un número válido.
 
         {lista_prestadores}
 
@@ -850,9 +838,7 @@ async def guardar_prestador(
 async def guardar_fecha(
     telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     fecha = normalizar_fecha(SpeechResult.strip())
 
@@ -945,9 +931,7 @@ async def guardar_fecha(
 async def guardar_hora(
     telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     hora = normalizar_hora(SpeechResult.strip())
 
@@ -1188,9 +1172,7 @@ async def guardar_hora(
 async def aclarar_hora(
     telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     respuesta = SpeechResult.lower().strip()
 
@@ -1373,9 +1355,7 @@ async def aclarar_hora(
 async def reprogramar_fecha(
     telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     fecha = normalizar_fecha(SpeechResult.strip())
 
@@ -1472,9 +1452,7 @@ async def reprogramar_tipo_prestador(
     Digits: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     conversacion = (
         db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
@@ -1535,7 +1513,7 @@ async def reprogramar_tipo_prestador(
         speechTimeout="auto">
 
         <Say language="es-MX">
-            Perfecto, se atenderá con cualquier barbero disponible.
+            Perfecto, se atenderá con cualquier profesional disponible.
             ¿Para qué nueva fecha desea reprogramar su cita?
         </Say>
 
@@ -1568,8 +1546,8 @@ async def reprogramar_tipo_prestador(
         speechTimeout="auto">
 
         <Say language="es-MX">
-            Por el momento no hay barberos específicos disponibles para ese servicio.
-            Le atenderá cualquier barbero disponible.
+            Por el momento no hay profesionales específicos disponibles para ese servicio.
+            Le atenderá cualquier profesional disponible.
             ¿Para qué nueva fecha desea reprogramar su cita?
         </Say>
 
@@ -1600,13 +1578,13 @@ async def reprogramar_tipo_prestador(
     timeout="10">
 
         <Say language="es-MX">
-            Seleccione uno de los siguientes barberos.
+            Seleccione uno de los siguientes profesionales.
         </Say>
 
         {lista_prestadores}
 
         <Say language="es-MX">
-            Presione en su teléfono el número del barbero que desea.
+            Presione en su teléfono el número del profesional que desea.
         </Say>
 
     </Gather>
@@ -1639,9 +1617,7 @@ async def reprogramar_prestador(
     Digits: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     conversacion = (
         db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
@@ -1691,7 +1667,7 @@ async def reprogramar_prestador(
     method="POST"
     timeout="10">
 
-        No encontré ese barbero. Por favor presione un número válido.
+        No encontré ese profesional. Por favor presione un número válido.
 
         {lista_prestadores}
 
@@ -1732,9 +1708,7 @@ async def reprogramar_prestador(
 async def reprogramar_hora(
     telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     hora = normalizar_hora(SpeechResult.strip())
 
@@ -1980,9 +1954,7 @@ async def reprogramar_hora(
 async def aclarar_hora_reprogramar(
     telefono: str, SpeechResult: str = Form(""), db: Session = Depends(get_db)
 ):
-    telefono = telefono.replace("%2B", "+")
-    telefono = telefono.replace(" ", "")
-    telefono = telefono if telefono.startswith("+") else "+" + telefono
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
 
     respuesta = SpeechResult.lower().strip()
 

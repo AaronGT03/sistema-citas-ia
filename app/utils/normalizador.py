@@ -93,6 +93,9 @@ def normalizar_fecha(texto: str) -> str | None:
         fecha = hoy + timedelta(days=2)
         return fecha.strftime("%d/%m/%Y")
 
+    if texto == "hoy":
+        return hoy.strftime("%d/%m/%Y")
+
     if texto == "mañana":
         fecha = hoy + timedelta(days=1)
         return fecha.strftime("%d/%m/%Y")
