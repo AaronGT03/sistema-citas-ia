@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "D:\\ProyectCallIA\\sistema-citas-front"],
+      "port": 5173
+    }
+  ]
+}

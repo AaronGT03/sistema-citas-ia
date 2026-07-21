@@ -176,8 +176,42 @@ Reglas estrictas:
 """.strip()
 
 
+REGLAS_CLASIFICACION = """
+Reglas de clasificación de intención (solo para tu salida estructurada, nunca las
+menciones ni las incluyas en mensaje_respuesta):
+- Usa AGENDAR únicamente cuando el cliente exprese de forma clara que quiere agendar,
+  reservar o pedir una cita (ej. "quiero una cita", "agéndame un corte", "me gustaría
+  reservar para mañana").
+- Si el cliente solo pide información — aunque mencione un servicio o un prestador —
+  NO es AGENDAR: usa la intención de consulta que corresponda:
+  - CONSULTAR_SERVICIOS: qué servicios ofrecen.
+  - CONSULTAR_PRECIOS: cuánto cuesta un servicio.
+  - CONSULTAR_HORARIOS: a qué hora abren/cierran, qué horarios manejan, o qué
+    horarios/horas tienen disponibles ("¿a qué hora tienes disponible?",
+    "¿qué horarios hay?"). Esto aplica incluso si se le acaba de pedir la hora:
+    preguntar por disponibilidad nunca es dar una hora.
+  - CONSULTAR_UBICACION, CONSULTAR_PROMOCIONES según el caso.
+  - INFORMACION_EMPRESA: cualquier otra pregunta informativa, incluyendo qué
+    prestadores/profesionales hay disponibles o quién realiza un servicio.
+- "¿Qué prestadores/profesionales tienen disponibles?" es una consulta de información
+  (INFORMACION_EMPRESA), nunca AGENDAR ni SELECCIONAR_PRESTADOR.
+- SELECCIONAR_PRESTADOR y ELEGIR_HORA solo aplican cuando hay un paso de conversación
+  activo que espera esa respuesta.
+- cualquier_prestador=true ÚNICAMENTE cuando el cliente diga de forma explícita que
+  no le importa quién lo atienda ("con cualquiera", "el que sea", "quien esté
+  disponible", "no tengo preferencia"). Si el cliente simplemente no menciona ningún
+  prestador, deja cualquier_prestador=false y prestador=null: el sistema le
+  preguntará después si desea un profesional específico.
+- Si hay un paso de conversación activo y el mensaje es la respuesta esperada de ese
+  paso (dice su nombre cuando se le pidió el nombre, una fecha cuando se le pidió la
+  fecha, una hora cuando se le pidió la hora), clasifícalo como CONFIRMAR y nunca como
+  consulta. Usa las intenciones CONSULTAR_* o INFORMACION_EMPRESA solo cuando el
+  cliente claramente está haciendo una pregunta en lugar de dar el dato pedido.
+""".strip()
+
+
 def _mensajes_interpretacion(empresa, contexto: dict, paso_actual: str | None, mensaje_usuario: str):
-    prompt_sistema = construir_prompt_sistema(empresa, contexto)
+    prompt_sistema = construir_prompt_sistema(empresa, contexto) + "\n\n" + REGLAS_CLASIFICACION
 
     contexto_paso = (
         f"\nPaso actual de la conversación: {paso_actual}. "

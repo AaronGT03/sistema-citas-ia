@@ -1,3 +1,5 @@
+from xml.sax.saxutils import escape
+
 from fastapi import APIRouter, Depends, Form
 from sqlalchemy.orm import Session
 from fastapi.responses import Response
@@ -85,6 +87,138 @@ def respuesta_sin_prestadores(alternativas=None):
         No hay profesionales disponibles en ese horario.
     </Say>
 {mensaje_alternativas}
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+# Intenciones que significan "el cliente está preguntando algo" en lugar de
+# responder el dato que el flujo le pidió. FUERA_DE_CONTEXTO se incluye para
+# responder con el mensaje de respaldo y retomar el flujo en vez de colgar.
+INTENCIONES_CONSULTA = (
+    "SALUDO",
+    "INFORMACION_EMPRESA",
+    "CONSULTAR_SERVICIOS",
+    "CONSULTAR_PRECIOS",
+    "CONSULTAR_HORARIOS",
+    "CONSULTAR_UBICACION",
+    "CONSULTAR_PROMOCIONES",
+    "FUERA_DE_CONTEXTO",
+)
+
+
+def responder_consulta_en_flujo(
+    db: Session,
+    empresa: Empresa,
+    mensaje_usuario: str,
+    action: str,
+    pregunta_pendiente: str,
+    paso_actual: str | None = None,
+    resultado_ia=None,
+    contexto: dict | None = None,
+):
+    """Los clientes no conocen el flujo: a mitad de la captura pueden preguntar
+    precios, servicios, prestadores, etc. Si el mensaje es una consulta y no la
+    respuesta al paso pendiente, la contesta con la IA y repite la pregunta del
+    paso en el mismo Gather (el estado de la conversación no se toca). Devuelve
+    None si el mensaje no es una consulta, para que el llamador siga su flujo
+    normal. `action` debe venir ya escapado para XML (usar &amp;)."""
+
+    if not empresa or not mensaje_usuario or not mensaje_usuario.strip():
+        return None
+
+    if contexto is None:
+        contexto = construir_contexto_empresa(db, empresa)
+
+    if resultado_ia is None:
+        resultado_ia = interpretar_mensaje(
+            empresa=empresa,
+            contexto=contexto,
+            paso_actual=paso_actual,
+            mensaje_usuario=mensaje_usuario,
+        )
+
+    if not resultado_ia or resultado_ia.intencion not in INTENCIONES_CONSULTA:
+        return None
+
+    if resultado_ia.dentro_del_dominio:
+        texto = responder_pregunta_empresa(empresa, contexto, mensaje_usuario)
+    else:
+        texto = f"Solo puedo ayudarte con información, servicios y citas de {empresa.nombre}."
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="{action}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            {escape(texto)}
+        </Say>
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Continuemos con su cita. {escape(pregunta_pendiente)}
+        </Say>
+
+    </Gather>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+def respuesta_disponibilidad_en_flujo(
+    db: Session,
+    empresa: Empresa,
+    fecha: str,
+    servicio_id: int | None,
+    prestador_id: int | None,
+    action: str,
+    pregunta_pendiente: str,
+):
+    """Cuando en el paso de la hora el cliente pregunta qué horarios hay
+    ("¿a qué hora tienes disponible?"), responde con la disponibilidad real
+    de la fecha ya capturada y vuelve a preguntar la hora sin perder el flujo."""
+
+    horarios = obtener_horarios_disponibles(
+        db=db,
+        empresa=empresa,
+        fecha=fecha,
+        servicio_id=servicio_id,
+        prestador_id=prestador_id,
+    )
+
+    if horarios:
+        horas_texto = ", ".join(horarios[:6])
+        texto = f"Para el día {fecha} tengo disponibles estos horarios: {horas_texto}."
+    else:
+        texto = (
+            f"Por el momento no tengo horarios disponibles para el día {fecha}. "
+            "Puede volver a llamar para intentar con otra fecha."
+        )
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="{action}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            {escape(texto)}
+        </Say>
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            {escape(pregunta_pendiente)}
+        </Say>
+
+    </Gather>
 </Response>
 """
     return Response(content=twiml, media_type="application/xml")
@@ -563,6 +697,18 @@ def _continuar_agendado_ia_llamada(
 """
             return Response(content=twiml, media_type="application/xml")
 
+        respuesta_consulta = responder_consulta_en_flujo(
+            db=db,
+            empresa=empresa,
+            mensaje_usuario=nombre_limpio,
+            action=f"/agendar-ia-continuar?telefono={telefono}",
+            pregunta_pendiente="¿Cuál es su nombre completo?",
+            paso_actual="PEDIR_NOMBRE",
+        )
+
+        if respuesta_consulta is not None:
+            return respuesta_consulta
+
         flujo.nombre = nombre_limpio
         flujo.mensaje = None
         db.commit()
@@ -570,7 +716,40 @@ def _continuar_agendado_ia_llamada(
     elif marcador == "ESPERANDO_FECHA":
         fecha = normalizar_fecha(speech.strip())
 
+        contexto = None
+        resultado_ia = None
+
         if fecha is None:
+            contexto = construir_contexto_empresa(db, empresa)
+            resultado_ia = interpretar_mensaje(
+                empresa=empresa,
+                contexto=contexto,
+                paso_actual="PEDIR_FECHA",
+                mensaje_usuario=speech.strip(),
+            )
+
+            if resultado_ia and resultado_ia.fecha:
+                fecha_ia = normalizar_fecha_iso(resultado_ia.fecha) or normalizar_fecha(
+                    resultado_ia.fecha
+                )
+
+                if fecha_ia and not fecha_ya_paso(fecha_ia):
+                    fecha = fecha_ia
+
+        if fecha is None:
+            respuesta_consulta = responder_consulta_en_flujo(
+                db=db,
+                empresa=empresa,
+                mensaje_usuario=speech.strip(),
+                action=f"/agendar-ia-continuar?telefono={telefono}",
+                pregunta_pendiente="¿Qué fecha desea para su cita?",
+                resultado_ia=resultado_ia,
+                contexto=contexto,
+            )
+
+            if respuesta_consulta is not None:
+                return respuesta_consulta
+
             twiml = f"""
 <Response>
     <Gather
@@ -664,6 +843,18 @@ def _continuar_agendado_ia_llamada(
             return Response(content=twiml, media_type="application/xml")
 
     elif marcador == "ESPERANDO_HORA_ACLARACION":
+        respuesta_consulta = responder_consulta_en_flujo(
+            db=db,
+            empresa=empresa,
+            mensaje_usuario=speech.strip(),
+            action=f"/agendar-ia-continuar?telefono={telefono}",
+            pregunta_pendiente=f"¿Se refiere a las {flujo.hora} de la mañana o de la tarde?",
+            paso_actual="ACLARAR_HORA",
+        )
+
+        if respuesta_consulta is not None:
+            return respuesta_consulta
+
         hora_original = flujo.hora or ""
         respuesta_texto = speech.lower().strip()
 
@@ -731,7 +922,46 @@ def _continuar_agendado_ia_llamada(
             return Response(content=twiml, media_type="application/xml")
 
         if hora is None:
-            twiml = f"""
+            contexto = construir_contexto_empresa(db, empresa)
+            resultado_ia = interpretar_mensaje(
+                empresa=empresa,
+                contexto=contexto,
+                paso_actual="PEDIR_HORA",
+                mensaje_usuario=speech.strip(),
+            )
+
+            if resultado_ia and resultado_ia.hora:
+                hora_ia = normalizar_hora_valida(resultado_ia.hora)
+
+                if hora_ia:
+                    hora = hora_ia
+
+            if hora is None:
+                if resultado_ia and resultado_ia.intencion in ("CONSULTAR_HORARIOS", "ELEGIR_HORA"):
+                    return respuesta_disponibilidad_en_flujo(
+                        db=db,
+                        empresa=empresa,
+                        fecha=flujo.fecha,
+                        servicio_id=flujo.servicio_id,
+                        prestador_id=flujo.prestador_id,
+                        action=f"/agendar-ia-continuar?telefono={telefono}",
+                        pregunta_pendiente="¿A qué hora desea la cita?",
+                    )
+
+                respuesta_consulta = responder_consulta_en_flujo(
+                    db=db,
+                    empresa=empresa,
+                    mensaje_usuario=speech.strip(),
+                    action=f"/agendar-ia-continuar?telefono={telefono}",
+                    pregunta_pendiente="¿A qué hora desea la cita?",
+                    resultado_ia=resultado_ia,
+                    contexto=contexto,
+                )
+
+                if respuesta_consulta is not None:
+                    return respuesta_consulta
+
+                twiml = f"""
 <Response>
     <Gather
         input="speech"
@@ -748,7 +978,7 @@ def _continuar_agendado_ia_llamada(
     </Gather>
 </Response>
 """
-            return Response(content=twiml, media_type="application/xml")
+                return Response(content=twiml, media_type="application/xml")
 
         resultado_hora = _validar_y_guardar_hora_ia(db, empresa, flujo, hora, telefono)
 
@@ -783,13 +1013,8 @@ def iniciar_agendado_desde_ia_llamada(
     if not servicio:
         return None
 
-    conversacion_existente = (
-        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
-    )
-
-    if conversacion_existente:
-        db.delete(conversacion_existente)
-        db.commit()
+    db.query(Conversacion).filter(Conversacion.telefono == telefono).delete()
+    db.commit()
 
     nombre = resultado_ia.nombre.strip() if resultado_ia.nombre else None
 
@@ -986,13 +1211,8 @@ async def procesar_cita(
         return Response(content=twiml, media_type="application/xml")
 
     elif "reprogramar" in respuesta:
-        conversacion_existente = (
-            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
-        )
-
-        if conversacion_existente:
-            db.delete(conversacion_existente)
-            db.commit()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).delete()
+        db.commit()
 
         empresa = db.query(Empresa).filter(Empresa.id == empresa_id).first()
 
@@ -1061,6 +1281,19 @@ async def procesar_cita(
 
         return Response(content=twiml, media_type="application/xml")
 
+    empresa = db.query(Empresa).filter(Empresa.id == empresa_id).first()
+
+    respuesta_consulta = responder_consulta_en_flujo(
+        db=db,
+        empresa=empresa,
+        mensaje_usuario=SpeechResult.strip(),
+        action=f"/procesar-cita?telefono={telefono}&amp;empresa_id={empresa_id}",
+        pregunta_pendiente="Sobre su cita, diga cancelar o reprogramar.",
+    )
+
+    if respuesta_consulta is not None:
+        return respuesta_consulta
+
     return Response(
         content="""
 <Response>
@@ -1092,13 +1325,8 @@ async def procesar_agenda(
     print(f"Respuesta usuario: {respuesta}")
 
     def _iniciar_flujo_determinista_servicio():
-        conversacion_existente = (
-            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
-        )
-
-        if conversacion_existente:
-            db.delete(conversacion_existente)
-            db.commit()
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).delete()
+        db.commit()
 
         nueva_conversacion = Conversacion(
             telefono=telefono, empresa_id=empresa_id, paso="PEDIR_SERVICIO"
@@ -1268,6 +1496,20 @@ async def guardar_nombre(
 </Response>
 """
         return Response(content=twiml, media_type="application/xml")
+
+    empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+
+    respuesta_consulta = responder_consulta_en_flujo(
+        db=db,
+        empresa=empresa,
+        mensaje_usuario=nombre,
+        action=f"/guardar-nombre?telefono={telefono}",
+        pregunta_pendiente="¿Cuál es su nombre completo?",
+        paso_actual="PEDIR_NOMBRE",
+    )
+
+    if respuesta_consulta is not None:
+        return respuesta_consulta
 
     conversacion.nombre = nombre
     conversacion.paso = "PEDIR_FECHA"
@@ -1708,6 +1950,9 @@ async def guardar_fecha(
             else None
         )
 
+        contexto = None
+        resultado_ia = None
+
         if empresa_para_ia:
             contexto = construir_contexto_empresa(db, empresa_para_ia)
             resultado_ia = interpretar_mensaje(
@@ -1726,6 +1971,19 @@ async def guardar_fecha(
                     fecha = fecha_ia
 
         if fecha is None:
+            respuesta_consulta = responder_consulta_en_flujo(
+                db=db,
+                empresa=empresa_para_ia,
+                mensaje_usuario=SpeechResult.strip(),
+                action=f"/guardar-fecha?telefono={telefono}",
+                pregunta_pendiente="¿Qué fecha desea para su cita?",
+                resultado_ia=resultado_ia,
+                contexto=contexto,
+            )
+
+            if respuesta_consulta is not None:
+                return respuesta_consulta
+
             twiml = f"""
 <Response>
     <Gather
@@ -2033,6 +2291,9 @@ async def guardar_hora(
             else None
         )
 
+        contexto = None
+        resultado_ia = None
+
         if empresa_para_ia and conversacion_para_ia:
             contexto = construir_contexto_empresa(db, empresa_para_ia)
             resultado_ia = interpretar_mensaje(
@@ -2049,6 +2310,34 @@ async def guardar_hora(
                     hora = hora_ia
 
         if hora is None:
+            if (
+                resultado_ia
+                and conversacion_para_ia
+                and resultado_ia.intencion in ("CONSULTAR_HORARIOS", "ELEGIR_HORA")
+            ):
+                return respuesta_disponibilidad_en_flujo(
+                    db=db,
+                    empresa=empresa_para_ia,
+                    fecha=conversacion_para_ia.fecha,
+                    servicio_id=conversacion_para_ia.servicio_id,
+                    prestador_id=conversacion_para_ia.prestador_id,
+                    action=f"/guardar-hora?telefono={telefono}",
+                    pregunta_pendiente="¿A qué hora desea la cita?",
+                )
+
+            respuesta_consulta = responder_consulta_en_flujo(
+                db=db,
+                empresa=empresa_para_ia,
+                mensaje_usuario=SpeechResult.strip(),
+                action=f"/guardar-hora?telefono={telefono}",
+                pregunta_pendiente="¿A qué hora desea la cita?",
+                resultado_ia=resultado_ia,
+                contexto=contexto,
+            )
+
+            if respuesta_consulta is not None:
+                return respuesta_consulta
+
             twiml = f"""
 <Response>
     <Gather
@@ -2260,6 +2549,25 @@ async def aclarar_hora(
             media_type="application/xml",
         )
 
+    if conversacion.paso == "ACLARAR_HORA_REPROGRAMAR":
+        accion_consulta = f"/aclarar-hora-reprogramar?telefono={telefono}"
+    else:
+        accion_consulta = f"/aclarar-hora?telefono={telefono}"
+
+    empresa_consulta = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+
+    respuesta_consulta = responder_consulta_en_flujo(
+        db=db,
+        empresa=empresa_consulta,
+        mensaje_usuario=SpeechResult.strip(),
+        action=accion_consulta,
+        pregunta_pendiente=f"¿Se refiere a las {conversacion.hora} de la mañana o de la tarde?",
+        paso_actual="ACLARAR_HORA",
+    )
+
+    if respuesta_consulta is not None:
+        return respuesta_consulta
+
     hora_original = conversacion.hora
 
     try:
@@ -2448,6 +2756,27 @@ async def reprogramar_fecha(
 
 
     if fecha is None:
+        conversacion_para_ia = (
+            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+        )
+        empresa_para_ia = (
+            db.query(Empresa).filter(Empresa.id == conversacion_para_ia.empresa_id).first()
+            if conversacion_para_ia
+            else None
+        )
+
+        respuesta_consulta = responder_consulta_en_flujo(
+            db=db,
+            empresa=empresa_para_ia,
+            mensaje_usuario=SpeechResult.strip(),
+            action=f"/reprogramar-fecha?telefono={telefono}",
+            pregunta_pendiente="¿Para qué nueva fecha desea reprogramar su cita?",
+            paso_actual="REPROGRAMAR_FECHA",
+        )
+
+        if respuesta_consulta is not None:
+            return respuesta_consulta
+
         twiml = f"""
 <Response>
     <Gather
@@ -2829,7 +3158,62 @@ async def reprogramar_hora(
         return Response(content=twiml, media_type="application/xml")
 
     if hora is None:
-        twiml = f"""
+        conversacion_para_ia = (
+            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+        )
+        empresa_para_ia = (
+            db.query(Empresa).filter(Empresa.id == conversacion_para_ia.empresa_id).first()
+            if conversacion_para_ia
+            else None
+        )
+
+        contexto = None
+        resultado_ia = None
+
+        if empresa_para_ia:
+            contexto = construir_contexto_empresa(db, empresa_para_ia)
+            resultado_ia = interpretar_mensaje(
+                empresa=empresa_para_ia,
+                contexto=contexto,
+                paso_actual="REPROGRAMAR_HORA",
+                mensaje_usuario=SpeechResult.strip(),
+            )
+
+            if resultado_ia and resultado_ia.hora:
+                hora_ia = normalizar_hora_valida(resultado_ia.hora)
+
+                if hora_ia:
+                    hora = hora_ia
+
+        if hora is None and resultado_ia and conversacion_para_ia and resultado_ia.intencion in (
+            "CONSULTAR_HORARIOS",
+            "ELEGIR_HORA",
+        ):
+            return respuesta_disponibilidad_en_flujo(
+                db=db,
+                empresa=empresa_para_ia,
+                fecha=conversacion_para_ia.fecha,
+                servicio_id=conversacion_para_ia.servicio_id,
+                prestador_id=conversacion_para_ia.prestador_id,
+                action=f"/reprogramar-hora?telefono={telefono}",
+                pregunta_pendiente="¿A qué nueva hora desea reprogramar su cita?",
+            )
+
+        if hora is None:
+            respuesta_consulta = responder_consulta_en_flujo(
+                db=db,
+                empresa=empresa_para_ia,
+                mensaje_usuario=SpeechResult.strip(),
+                action=f"/reprogramar-hora?telefono={telefono}",
+                pregunta_pendiente="¿A qué nueva hora desea reprogramar su cita?",
+                resultado_ia=resultado_ia,
+                contexto=contexto,
+            )
+
+            if respuesta_consulta is not None:
+                return respuesta_consulta
+
+            twiml = f"""
 <Response>
     <Gather
         input="speech"
@@ -2855,7 +3239,7 @@ async def reprogramar_hora(
 </Response>
 """
 
-        return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type="application/xml")
 
     conversacion = (
         db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
@@ -3041,6 +3425,25 @@ async def aclarar_hora_reprogramar(
 """,
             media_type="application/xml",
         )
+
+    if conversacion.paso == "ACLARAR_HORA_REPROGRAMAR":
+        accion_consulta = f"/aclarar-hora-reprogramar?telefono={telefono}"
+    else:
+        accion_consulta = f"/aclarar-hora?telefono={telefono}"
+
+    empresa_consulta = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+
+    respuesta_consulta = responder_consulta_en_flujo(
+        db=db,
+        empresa=empresa_consulta,
+        mensaje_usuario=SpeechResult.strip(),
+        action=accion_consulta,
+        pregunta_pendiente=f"¿Se refiere a las {conversacion.hora} de la mañana o de la tarde?",
+        paso_actual="ACLARAR_HORA",
+    )
+
+    if respuesta_consulta is not None:
+        return respuesta_consulta
 
     hora_original = conversacion.hora
 

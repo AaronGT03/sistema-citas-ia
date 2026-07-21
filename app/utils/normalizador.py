@@ -65,8 +65,12 @@ def _obtener_numero(texto: str):
     return None
 
 
+FILLERS_FECHA = re.compile(r"\b(para|el|la|los|dia|día|de|del|mismo)\b")
+
+
 def normalizar_fecha(texto: str) -> str | None:
     texto = texto.lower().strip()
+    texto = re.sub(r"[.,;!¡¿?]+$", "", texto).strip()
     hoy = datetime.now()
 
     # 26/06/2026, 26-06-2026, 26.06.2026
@@ -89,14 +93,20 @@ def normalizar_fecha(texto: str) -> str | None:
         except ValueError:
             return None
 
-    if texto == "pasado mañana":
+    # Quita muletillas como "para", "el", "de", "mismo" para reconocer
+    # frases naturales tipo "para hoy", "hoy mismo", "el día de hoy",
+    # "para mañana", "el mañana", sin depender de la palabra exacta.
+    texto_simplificado = FILLERS_FECHA.sub(" ", texto)
+    texto_simplificado = re.sub(r"\s+", " ", texto_simplificado).strip()
+
+    if texto_simplificado == "pasado mañana":
         fecha = hoy + timedelta(days=2)
         return fecha.strftime("%d/%m/%Y")
 
-    if texto == "hoy":
+    if texto_simplificado == "hoy":
         return hoy.strftime("%d/%m/%Y")
 
-    if texto == "mañana":
+    if texto_simplificado == "mañana":
         fecha = hoy + timedelta(days=1)
         return fecha.strftime("%d/%m/%Y")
 
