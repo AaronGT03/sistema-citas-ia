@@ -19,13 +19,30 @@ from app.services.citas_service import (
     horario_choca_con_duracion,
     obtener_prestadores_compatibles,
     seleccionar_prestador_automaticamente,
+    crear_solicitud_sin_hora,
+    construir_contexto_empresa,
+    resolver_por_nombre,
+    vocabulario_por_giro,
 )
-from app.utils import normalizar_fecha, normalizar_hora, normalizar_telefono_mexico
+from app.services.openai_service import interpretar_mensaje, responder_pregunta_empresa
+from app.utils import (
+    normalizar_fecha,
+    normalizar_hora,
+    normalizar_telefono_mexico,
+    normalizar_fecha_iso,
+    normalizar_hora_valida,
+)
 from app.core.config import META_VERIFY_TOKEN
 
 router = APIRouter(tags=["WhatsApp"])
 
 _SIN_VALOR = object()
+
+
+def _titulo_boton(preferido: str, respaldo: str) -> str:
+    # WhatsApp limita los títulos de botón a 20 caracteres; si el término
+    # del giro hace que el título se pase, se usa el respaldo corto.
+    return preferido if len(preferido) <= 20 else respaldo
 
 
 @router.get("/webhook-whatsapp")
@@ -204,6 +221,495 @@ def enviar_menu_principal(
     )
 
 
+# =====================================================================
+# Arranque del flujo de agendado a partir de datos ya extraídos por
+# OpenAI (mensaje libre inicial tipo "quiero un corte con Jeremy hoy a
+# las 4"). Reutiliza exactamente las mismas funciones de validación de
+# app/services/citas_service.py que usa el flujo determinístico paso a
+# paso — nunca crea una cita sin pasar por esas validaciones. Si algún
+# dato no se puede resolver con certeza contra los datos reales de la
+# empresa, se retoma el flujo normal preguntando lo que falte, en el
+# mismo orden que sigue el flujo determinístico existente.
+# =====================================================================
+
+_resolver_por_nombre = resolver_por_nombre
+
+
+def _continuar_agendado_ia(
+    db: Session,
+    empresa,
+    numero,
+    telefono_cliente: str,
+    flujo,
+    respuesta_usuario: str | None,
+):
+    """Procesa la siguiente respuesta del cliente dentro del paso
+    "AGENDAR_IA" y decide qué falta a continuación. `flujo.mensaje` se
+    reutiliza como marcador interno de qué sub-pregunta está pendiente
+    (nunca se muestra al cliente ni se usa para nada más, ya que el resto
+    del sistema ya no guarda mensajes ahí). Nunca crea/reprograma una cita
+    sin pasar por las mismas validaciones de citas_service.py que usa el
+    flujo determinístico."""
+
+    servicio = db.query(Servicio).filter(Servicio.id == flujo.servicio_id).first()
+    marcador = flujo.mensaje
+    vocab = vocabulario_por_giro(empresa.giro)
+
+    if marcador == "ESPERANDO_TIPO_PRESTADOR":
+        if respuesta_usuario == "CUALQUIER_PRESTADOR":
+            flujo.asignacion_automatica = True
+            flujo.mensaje = None
+            db.commit()
+        elif respuesta_usuario == "ELEGIR_PRESTADOR":
+            prestadores = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+
+            if not prestadores:
+                flujo.asignacion_automatica = True
+                flujo.mensaje = None
+                db.commit()
+            else:
+                flujo.mensaje = "ESPERANDO_PRESTADOR_ESPECIFICO"
+                db.commit()
+
+                filas = [{"id": f"PRESTADOR_{p.id}", "title": p.nombre} for p in prestadores]
+                enviar_lista_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto=f"Selecciona el {vocab['prestador']} con el que deseas atenderte:",
+                    boton_texto=_titulo_boton(f"Ver {vocab['prestador_plural']}", "Ver opciones"),
+                    filas=filas,
+                )
+                return
+        else:
+            enviar_botones_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                texto="Por favor selecciona una opción.",
+                botones=[
+                    {"id": "ELEGIR_PRESTADOR", "title": _titulo_boton(f"Elegir {vocab['prestador']}", "Elegir")},
+                    {"id": "CUALQUIER_PRESTADOR", "title": "Cualquiera"},
+                ],
+            )
+            return
+
+    elif marcador == "ESPERANDO_PRESTADOR_ESPECIFICO":
+        prestadores = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+        prestador = None
+
+        if respuesta_usuario and respuesta_usuario.startswith("PRESTADOR_"):
+            try:
+                prestador_id_elegido = int(respuesta_usuario.replace("PRESTADOR_", ""))
+            except ValueError:
+                prestador_id_elegido = None
+
+            prestador = next((p for p in prestadores if p.id == prestador_id_elegido), None)
+
+        if not prestador:
+            filas = [{"id": f"PRESTADOR_{p.id}", "title": p.nombre} for p in prestadores]
+            enviar_lista_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                texto=f"No reconocí esa opción. Por favor selecciona un {vocab['prestador']} de la lista:",
+                boton_texto=_titulo_boton(f"Ver {vocab['prestador_plural']}", "Ver opciones"),
+                filas=filas,
+            )
+            return
+
+        flujo.prestador_id = prestador.id
+        flujo.asignacion_automatica = False
+        flujo.mensaje = None
+        db.commit()
+
+    elif marcador == "ESPERANDO_NOMBRE":
+        nombre_limpio = (respuesta_usuario or "").strip()
+
+        if not nombre_limpio:
+            enviar_respuesta(numero, telefono_cliente, "¿Cuál es tu nombre completo?")
+            return
+
+        flujo.nombre = nombre_limpio
+        flujo.mensaje = None
+        db.commit()
+
+    elif marcador == "ESPERANDO_FECHA":
+        fecha = normalizar_fecha((respuesta_usuario or "").strip())
+
+        if fecha is None:
+            enviar_respuesta(
+                numero,
+                telefono_cliente,
+                "No entendí la fecha.\nPor favor escribe una fecha como: 25 de junio o 25/06/2026.",
+            )
+            return
+
+        if fecha_ya_paso(fecha):
+            enviar_respuesta(
+                numero, telefono_cliente, "Esa fecha ya pasó.\nPor favor indica una fecha futura."
+            )
+            return
+
+        flujo.fecha = fecha
+        flujo.mensaje = None
+        db.commit()
+
+    elif marcador == "ESPERANDO_TIPO_HORA":
+        if respuesta_usuario == "SIN_HORA_ESPECIFICA":
+            flujo.sin_hora_especifica = True
+            flujo.mensaje = None
+            db.commit()
+        elif respuesta_usuario == "HORA_ESPECIFICA":
+            flujo.mensaje = "ESPERANDO_HORA"
+            db.commit()
+
+            enviar_respuesta(numero, telefono_cliente, "¿A qué hora deseas tu cita?")
+            return
+        else:
+            enviar_botones_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                texto="Por favor selecciona una opción.",
+                botones=[
+                    {"id": "HORA_ESPECIFICA", "title": "Hora específica"},
+                    {"id": "SIN_HORA_ESPECIFICA", "title": "Sin preferencia"},
+                ],
+            )
+            return
+
+    elif marcador == "ESPERANDO_HORA":
+        hora = normalizar_hora((respuesta_usuario or "").strip())
+
+        if hora == "AMBIGUA":
+            enviar_respuesta(
+                numero,
+                telefono_cliente,
+                f"¿Te refieres a las {(respuesta_usuario or '').strip()} de la mañana o de la "
+                "tarde? Por favor indica la hora completa, ej. 4 de la tarde.",
+            )
+            return
+
+        if hora is None:
+            enviar_respuesta(
+                numero,
+                telefono_cliente,
+                "No entendí la hora.\nPor favor escribe una hora como: 10:00, 3 pm o 5 de la tarde.",
+            )
+            return
+
+        if hora_ya_paso(flujo.fecha, hora):
+            enviar_respuesta(
+                numero, telefono_cliente, "Esa hora ya pasó.\nPor favor indica una hora futura."
+            )
+            return
+
+        if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+            enviar_respuesta(
+                numero,
+                telefono_cliente,
+                f"Lo siento, nuestro horario de atención es de {empresa.horario_inicio} a "
+                f"{empresa.horario_fin}.\n\nPor favor indica otra hora.",
+            )
+            return
+
+        flujo.hora = hora
+        flujo.mensaje = None
+        db.commit()
+
+    # ---- Con el estado ya actualizado, decide qué falta a continuación ----
+
+    if empresa.usa_prestadores and not flujo.prestador_id and not flujo.asignacion_automatica:
+        flujo.mensaje = "ESPERANDO_TIPO_PRESTADOR"
+        db.commit()
+
+        enviar_botones_whatsapp(
+            phone_number_id=numero.phone_number_id,
+            token=numero.token,
+            telefono_cliente=telefono_cliente,
+            texto=(
+                f"Para tu {servicio.nombre}, ¿deseas atenderte con un {vocab['prestador']} "
+                "específico o con cualquiera disponible?"
+            ),
+            botones=[
+                {"id": "ELEGIR_PRESTADOR", "title": _titulo_boton(f"Elegir {vocab['prestador']}", "Elegir")},
+                {"id": "CUALQUIER_PRESTADOR", "title": "Cualquiera"},
+            ],
+        )
+        return
+
+    if not flujo.nombre:
+        flujo.mensaje = "ESPERANDO_NOMBRE"
+        db.commit()
+
+        enviar_respuesta(numero, telefono_cliente, "¡Perfecto! ¿Cuál es tu nombre completo?")
+        return
+
+    if not flujo.fecha:
+        flujo.mensaje = "ESPERANDO_FECHA"
+        db.commit()
+
+        enviar_respuesta(
+            numero,
+            telefono_cliente,
+            f"Gracias {flujo.nombre}. ¿Qué fecha deseas para tu cita?\n"
+            "Ejemplo: 25 de junio o 25/06/2026",
+        )
+        return
+
+    if not flujo.hora and not flujo.sin_hora_especifica:
+        if empresa.permite_citas_sin_hora:
+            flujo.mensaje = "ESPERANDO_TIPO_HORA"
+            db.commit()
+
+            enviar_botones_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                texto=(
+                    f"Registré la fecha {flujo.fecha}.\n\n"
+                    "¿Deseas elegir una hora específica o agendar sin preferencia de horario?"
+                ),
+                botones=[
+                    {"id": "HORA_ESPECIFICA", "title": "Hora específica"},
+                    {"id": "SIN_HORA_ESPECIFICA", "title": "Sin preferencia"},
+                ],
+            )
+        else:
+            flujo.mensaje = "ESPERANDO_HORA"
+            db.commit()
+
+            enviar_respuesta(
+                numero,
+                telefono_cliente,
+                f"Perfecto. Registré la fecha {flujo.fecha}.\n\n¿A qué hora deseas tu cita?",
+            )
+        return
+
+    # ---- Ya se conoce todo lo necesario: crear la cita ----
+
+    if flujo.sin_hora_especifica:
+        try:
+            crear_solicitud_sin_hora(
+                db=db,
+                empresa=empresa,
+                servicio=servicio,
+                fecha=flujo.fecha,
+                nombre=flujo.nombre,
+                telefono=telefono_cliente,
+                canal="WHATSAPP",
+                prestador_id=flujo.prestador_id,
+            )
+        except ValueError as error:
+            enviar_respuesta(
+                numero, telefono_cliente, f"No fue posible registrar tu solicitud: {error}."
+            )
+            return
+
+        enviar_respuesta(
+            numero,
+            telefono_cliente,
+            f"✅ Registré tu solicitud para el {flujo.fecha} sin hora específica.\n\n"
+            "La empresa te confirmará el horario más adelante.",
+        )
+        enviar_menu_principal(db=db, empresa=empresa, numero=numero, telefono_cliente=telefono_cliente)
+
+        db.delete(flujo)
+        db.commit()
+        return
+
+    prestador_final = flujo.prestador_id
+    horarios_alternativos = None
+    cita_ocupada = False
+
+    if empresa.usa_prestadores:
+        if flujo.prestador_id:
+            cita_ocupada = horario_choca_con_duracion(
+                db=db,
+                empresa_id=empresa.id,
+                fecha=flujo.fecha,
+                hora=flujo.hora,
+                servicio_id=servicio.id,
+                prestador_id=flujo.prestador_id,
+            )
+
+            if cita_ocupada:
+                horarios_alternativos = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=flujo.fecha,
+                    servicio_id=servicio.id,
+                    prestador_id=flujo.prestador_id,
+                )
+        else:
+            prestador_seleccionado = seleccionar_prestador_automaticamente(
+                db=db,
+                empresa_id=empresa.id,
+                servicio_id=servicio.id,
+                fecha=flujo.fecha,
+                hora=flujo.hora,
+            )
+
+            if not prestador_seleccionado:
+                cita_ocupada = True
+                horarios_alternativos = obtener_horarios_disponibles(
+                    db=db, empresa=empresa, fecha=flujo.fecha, servicio_id=servicio.id,
+                )
+            else:
+                prestador_final = prestador_seleccionado.id
+    else:
+        cita_ocupada = horario_choca_con_duracion(
+            db=db,
+            empresa_id=empresa.id,
+            fecha=flujo.fecha,
+            hora=flujo.hora,
+            servicio_id=servicio.id,
+        )
+
+        if cita_ocupada:
+            horarios_alternativos = obtener_horarios_disponibles(
+                db=db, empresa=empresa, fecha=flujo.fecha
+            )
+
+    if cita_ocupada:
+        if horarios_alternativos:
+            lista_horarios = "\n".join([f"- {h}" for h in horarios_alternativos[:5]])
+
+            flujo.hora = None
+            flujo.mensaje = "ESPERANDO_HORA"
+            db.commit()
+
+            respuesta = (
+                "Esa hora ya está ocupada.\n\n"
+                "Horarios disponibles para esa fecha:\n"
+                f"{lista_horarios}\n\n"
+                "Por favor escribe uno de esos horarios."
+            )
+        else:
+            flujo.fecha = None
+            flujo.hora = None
+            flujo.mensaje = "ESPERANDO_FECHA"
+            db.commit()
+
+            respuesta = "Ese día ya no tiene más horarios disponibles.\nPor favor indica otra fecha."
+
+        enviar_respuesta(numero, telefono_cliente, respuesta)
+        return
+
+    cita = crear_cita(
+        db=db,
+        nombre=flujo.nombre,
+        telefono=telefono_cliente,
+        fecha=flujo.fecha,
+        hora=flujo.hora,
+        empresa_id=empresa.id,
+        servicio_id=servicio.id,
+        canal="WHATSAPP",
+        prestador_id=prestador_final,
+    )
+
+    respuesta = (
+        "✅ Cita agendada correctamente\n\n"
+        f"Servicio: {servicio.nombre}\n"
+        f"Nombre: {cita.nombre}\n"
+        f"Fecha: {cita.fecha}\n"
+        f"Hora: {cita.hora}"
+    )
+
+    enviar_respuesta(numero, telefono_cliente, respuesta)
+    enviar_menu_principal(db=db, empresa=empresa, numero=numero, telefono_cliente=telefono_cliente)
+
+    db.delete(flujo)
+    db.commit()
+
+
+def iniciar_agendado_desde_ia(
+    db: Session,
+    empresa,
+    numero,
+    telefono_cliente: str,
+    resultado_ia,
+    mensaje_original: str,
+) -> bool:
+    """Punto de entrada: intenta arrancar el agendado con los datos que
+    OpenAI ya extrajo del mensaje libre del cliente. Devuelve False si no
+    se pudo resolver ni siquiera el servicio contra el catálogo real de la
+    empresa, para que el llamador use el mensaje genérico de "escribe
+    agendar cita". Si devuelve True, ya le respondió al cliente (con la
+    siguiente pregunta que falte, o con la cita ya creada)."""
+
+    servicios_activos = (
+        db.query(Servicio)
+        .filter(Servicio.empresa_id == empresa.id, Servicio.activo == True)
+        .all()
+    )
+
+    servicio = _resolver_por_nombre(resultado_ia.servicio, servicios_activos)
+
+    if not servicio:
+        return False
+
+    limpiar_flujos_activos(db, empresa.id, telefono_cliente)
+
+    nombre = resultado_ia.nombre.strip() if resultado_ia.nombre else None
+
+    fecha = None
+    if resultado_ia.fecha:
+        fecha_candidata = normalizar_fecha_iso(resultado_ia.fecha) or normalizar_fecha(
+            resultado_ia.fecha
+        )
+        if fecha_candidata and not fecha_ya_paso(fecha_candidata):
+            fecha = fecha_candidata
+
+    sin_hora = bool(resultado_ia.sin_hora_especifica and empresa.permite_citas_sin_hora)
+
+    hora = None
+    if not sin_hora and resultado_ia.hora:
+        hora = normalizar_hora_valida(resultado_ia.hora)
+
+    prestador_id = None
+    asignacion_automatica = False
+
+    if empresa.usa_prestadores:
+        if resultado_ia.cualquier_prestador:
+            asignacion_automatica = True
+        elif resultado_ia.prestador:
+            prestadores_compatibles = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+            prestador = _resolver_por_nombre(resultado_ia.prestador, prestadores_compatibles)
+
+            if prestador:
+                prestador_id = prestador.id
+
+    flujo = guardar_conversacion(
+        db=db,
+        empresa_id=empresa.id,
+        telefono_cliente=telefono_cliente,
+        mensaje=mensaje_original,
+        respuesta="",
+        paso="AGENDAR_IA",
+        nombre=nombre,
+        fecha=fecha,
+        hora=hora,
+        servicio_id=servicio.id,
+        prestador_id=prestador_id,
+        asignacion_automatica=asignacion_automatica,
+    )
+    flujo.sin_hora_especifica = sin_hora
+    db.commit()
+
+    _continuar_agendado_ia(
+        db=db,
+        empresa=empresa,
+        numero=numero,
+        telefono_cliente=telefono_cliente,
+        flujo=flujo,
+        respuesta_usuario=None,
+    )
+
+    return True
+
+
 @router.post("/webhook-whatsapp")
 async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
     data = await request.json()
@@ -261,6 +767,10 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
         print("EMPRESA:", empresa.nombre)
         print("CLIENTE:", telefono_cliente)
         print("MENSAJE:", mensaje)
+
+        # Términos conversacionales según el giro de la empresa (solo texto
+        # mostrado al cliente; la lógica no cambia).
+        vocab = vocabulario_por_giro(empresa.giro)
 
         flujo = obtener_flujo_activo(
             db=db,
@@ -421,10 +931,10 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                         "Encontré tu cita actual:\n\n"
                         f"Fecha: {cita.fecha}\n"
                         f"Hora: {cita.hora}\n\n"
-                        "¿Deseas mantener a tu mismo barbero o elegir otro?"
+                        f"¿Deseas mantener a tu mismo {vocab['prestador']} o elegir otro?"
                     )
                     botones = [
-                        {"id": "MISMO_PRESTADOR", "title": "Mismo barbero"},
+                        {"id": "MISMO_PRESTADOR", "title": f"Mismo {vocab['prestador']}"},
                         {"id": "ELEGIR_PRESTADOR", "title": "Elegir otro"},
                     ]
                 else:
@@ -432,12 +942,12 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                         "Encontré tu cita actual:\n\n"
                         f"Fecha: {cita.fecha}\n"
                         f"Hora: {cita.hora}\n\n"
-                        "¿Deseas atenderte con un barbero específico o con "
+                        f"¿Deseas atenderte con un {vocab['prestador']} específico o con "
                         "cualquiera disponible?"
                     )
                     botones = [
-                        {"id": "ELEGIR_PRESTADOR", "title": "Elegir barbero"},
-                        {"id": "CUALQUIER_PRESTADOR", "title": "Cualquier barbero"},
+                        {"id": "ELEGIR_PRESTADOR", "title": _titulo_boton(f"Elegir {vocab['prestador']}", "Elegir")},
+                        {"id": "CUALQUIER_PRESTADOR", "title": _titulo_boton(f"Cualquier {vocab['prestador']}", "Cualquiera")},
                     ]
 
                 guardar_conversacion(
@@ -490,7 +1000,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
         # =========================
         # INICIAR AGENDADO
         # =========================
-        if "agendar" in mensaje_lower and "cita" in mensaje_lower:
+        def _iniciar_flujo_determinista_servicio():
             limpiar_flujos_activos(db, empresa.id, telefono_cliente)
 
             servicios = (
@@ -537,6 +1047,52 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "PEDIR_SERVICIO"}
+
+        coincide_agendar = "agendar" in mensaje_lower and "cita" in mensaje_lower
+
+        if not flujo and mensaje.strip():
+            # La IA tiene prioridad sobre el disparador por palabra clave:
+            # se intenta primero interpretar el mensaje completo con
+            # OpenAI (igual que ya se hace en llamadas.py). El disparador
+            # determinístico ("agendar"+"cita") queda como respaldo
+            # únicamente para cuando OpenAI no está disponible o no
+            # devolvió nada — así nunca se depende por completo de un
+            # servicio externo.
+            contexto_ia_agendar = construir_contexto_empresa(db, empresa)
+            resultado_ia_agendar = interpretar_mensaje(
+                empresa=empresa,
+                contexto=contexto_ia_agendar,
+                paso_actual=None,
+                mensaje_usuario=mensaje.strip(),
+            )
+
+            if (
+                resultado_ia_agendar
+                and resultado_ia_agendar.dentro_del_dominio
+                and resultado_ia_agendar.intencion == "AGENDAR"
+            ):
+                iniciado = iniciar_agendado_desde_ia(
+                    db=db,
+                    empresa=empresa,
+                    numero=numero,
+                    telefono_cliente=telefono_cliente,
+                    resultado_ia=resultado_ia_agendar,
+                    mensaje_original=mensaje.strip(),
+                )
+
+                if iniciado:
+                    return {"status": "AGENDAR_DESDE_IA"}
+
+                # La IA detectó intención de agendar pero no logró
+                # reconocer ningún servicio real — continúa con el flujo
+                # clásico de elegir servicio por número.
+                return _iniciar_flujo_determinista_servicio()
+
+            if resultado_ia_agendar is None and coincide_agendar:
+                return _iniciar_flujo_determinista_servicio()
+
+        elif coincide_agendar:
+            return _iniciar_flujo_determinista_servicio()
 
         flujo = obtener_flujo_activo(
             db=db,
@@ -612,7 +1168,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
             if mensaje == "CUALQUIER_PRESTADOR" and not flujo.prestador_id:
                 respuesta = (
-                    "Perfecto, te atenderá cualquier barbero disponible.\n\n"
+                    f"Perfecto, te atenderá cualquier {vocab['prestador']} disponible.\n\n"
                     "¿Para qué nueva fecha deseas reprogramar tu cita?"
                 )
 
@@ -641,8 +1197,8 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
                 if not prestadores:
                     respuesta = (
-                        "Por el momento no hay barberos específicos disponibles "
-                        "para ese servicio. Te atenderá cualquier barbero "
+                        f"Por el momento no hay {vocab['prestador_plural']} específicos disponibles "
+                        f"para ese servicio. Te atenderá cualquier {vocab['prestador']} "
                         "disponible.\n\n¿Para qué nueva fecha deseas reprogramar "
                         "tu cita?"
                     )
@@ -675,7 +1231,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     empresa_id=empresa.id,
                     telefono_cliente=telefono_cliente,
                     mensaje=mensaje,
-                    respuesta="Selecciona un barbero",
+                    respuesta=f"Selecciona un {vocab['prestador']}",
                     paso="REPROGRAMAR_PRESTADOR",
                     nombre=flujo.nombre,
                     fecha=flujo.fecha,
@@ -687,8 +1243,8 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     phone_number_id=numero.phone_number_id,
                     token=numero.token,
                     telefono_cliente=telefono_cliente,
-                    texto="Selecciona el barbero con el que deseas atenderte:",
-                    boton_texto="Ver barberos",
+                    texto=f"Selecciona el {vocab['prestador']} con el que deseas atenderte:",
+                    boton_texto=_titulo_boton(f"Ver {vocab['prestador_plural']}", "Ver opciones"),
                     filas=filas,
                 )
 
@@ -720,7 +1276,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 )
 
             if not prestador_seleccionado:
-                respuesta = "No reconocí ese barbero. Por favor selecciónalo de la lista."
+                respuesta = f"No reconocí ese {vocab['prestador']}. Por favor selecciónalo de la lista."
 
                 filas = [
                     {"id": f"PRESTADOR_{prestador.id}", "title": prestador.nombre}
@@ -732,7 +1288,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     token=numero.token,
                     telefono_cliente=telefono_cliente,
                     texto=respuesta,
-                    boton_texto="Ver barberos",
+                    boton_texto=_titulo_boton(f"Ver {vocab['prestador_plural']}", "Ver opciones"),
                     filas=filas,
                 )
 
@@ -1259,6 +1815,20 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 return {"status": "CITA_REPROGRAMADA"}
 
         # =========================
+        # AGENDAR (arrancado por IA desde un mensaje libre) — continuar
+        # =========================
+        if flujo and flujo.paso == "AGENDAR_IA":
+            _continuar_agendado_ia(
+                db=db,
+                empresa=empresa,
+                numero=numero,
+                telefono_cliente=telefono_cliente,
+                flujo=flujo,
+                respuesta_usuario=mensaje,
+            )
+            return {"status": "AGENDAR_IA"}
+
+        # =========================
         # PEDIR SERVICIO
         # =========================
         if flujo and flujo.paso == "PEDIR_SERVICIO":
@@ -1293,7 +1863,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
             elif empresa.usa_prestadores:
                 respuesta = (
                     f"Perfecto, seleccionaste {servicio_seleccionado.nombre}.\n\n"
-                    "¿Deseas atenderte con un barbero específico o con cualquiera "
+                    f"¿Deseas atenderte con un {vocab['prestador']} específico o con cualquiera "
                     "disponible?"
                 )
 
@@ -1315,8 +1885,8 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     telefono_cliente=telefono_cliente,
                     texto=respuesta,
                     botones=[
-                        {"id": "ELEGIR_PRESTADOR", "title": "Elegir barbero"},
-                        {"id": "CUALQUIER_PRESTADOR", "title": "Cualquier barbero"},
+                        {"id": "ELEGIR_PRESTADOR", "title": _titulo_boton(f"Elegir {vocab['prestador']}", "Elegir")},
+                        {"id": "CUALQUIER_PRESTADOR", "title": _titulo_boton(f"Cualquier {vocab['prestador']}", "Cualquiera")},
                     ],
                 )
 
@@ -1347,7 +1917,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
         if flujo and flujo.paso == "PEDIR_TIPO_PRESTADOR":
             if mensaje == "CUALQUIER_PRESTADOR":
                 respuesta = (
-                    "Perfecto, te atenderá cualquier barbero disponible.\n\n"
+                    f"Perfecto, te atenderá cualquier {vocab['prestador']} disponible.\n\n"
                     "¿Cuál es tu nombre completo?"
                 )
 
@@ -1373,8 +1943,8 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
                 if not prestadores:
                     respuesta = (
-                        "Por el momento no hay barberos específicos disponibles "
-                        "para ese servicio. Te atenderá cualquier barbero "
+                        f"Por el momento no hay {vocab['prestador_plural']} específicos disponibles "
+                        f"para ese servicio. Te atenderá cualquier {vocab['prestador']} "
                         "disponible.\n\n¿Cuál es tu nombre completo?"
                     )
 
@@ -1403,7 +1973,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     empresa_id=empresa.id,
                     telefono_cliente=telefono_cliente,
                     mensaje=mensaje,
-                    respuesta="Selecciona un barbero",
+                    respuesta=f"Selecciona un {vocab['prestador']}",
                     paso="PEDIR_PRESTADOR",
                     servicio_id=flujo.servicio_id,
                 )
@@ -1412,15 +1982,15 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     phone_number_id=numero.phone_number_id,
                     token=numero.token,
                     telefono_cliente=telefono_cliente,
-                    texto="Selecciona el barbero con el que deseas atenderte:",
-                    boton_texto="Ver barberos",
+                    texto=f"Selecciona el {vocab['prestador']} con el que deseas atenderte:",
+                    boton_texto=_titulo_boton(f"Ver {vocab['prestador_plural']}", "Ver opciones"),
                     filas=filas,
                 )
 
                 return {"status": "PEDIR_PRESTADOR"}
 
             respuesta = (
-                "¿Deseas atenderte con un barbero específico o con cualquiera "
+                f"¿Deseas atenderte con un {vocab['prestador']} específico o con cualquiera "
                 "disponible?"
             )
 
@@ -1430,8 +2000,8 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 telefono_cliente=telefono_cliente,
                 texto=respuesta,
                 botones=[
-                    {"id": "ELEGIR_PRESTADOR", "title": "Elegir barbero"},
-                    {"id": "CUALQUIER_PRESTADOR", "title": "Cualquier barbero"},
+                    {"id": "ELEGIR_PRESTADOR", "title": _titulo_boton(f"Elegir {vocab['prestador']}", "Elegir")},
+                    {"id": "CUALQUIER_PRESTADOR", "title": _titulo_boton(f"Cualquier {vocab['prestador']}", "Cualquiera")},
                 ],
             )
 
@@ -1458,7 +2028,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 )
 
             if not prestador_seleccionado:
-                respuesta = "No reconocí ese barbero. Por favor selecciónalo de la lista."
+                respuesta = f"No reconocí ese {vocab['prestador']}. Por favor selecciónalo de la lista."
 
                 filas = [
                     {"id": f"PRESTADOR_{prestador.id}", "title": prestador.nombre}
@@ -1470,7 +2040,7 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                     token=numero.token,
                     telefono_cliente=telefono_cliente,
                     texto=respuesta,
-                    boton_texto="Ver barberos",
+                    boton_texto=_titulo_boton(f"Ver {vocab['prestador_plural']}", "Ver opciones"),
                     filas=filas,
                 )
 
@@ -1530,6 +2100,23 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
             fecha = normalizar_fecha(mensaje.strip())
 
             if fecha is None:
+                contexto_ia = construir_contexto_empresa(db, empresa)
+                resultado_ia = interpretar_mensaje(
+                    empresa=empresa,
+                    contexto=contexto_ia,
+                    paso_actual="PEDIR_FECHA",
+                    mensaje_usuario=mensaje.strip(),
+                )
+
+                if resultado_ia and resultado_ia.fecha:
+                    fecha_ia = normalizar_fecha_iso(resultado_ia.fecha) or normalizar_fecha(
+                        resultado_ia.fecha
+                    )
+
+                    if fecha_ia and not fecha_ya_paso(fecha_ia):
+                        fecha = fecha_ia
+
+            if fecha is None:
                 respuesta = (
                     "No entendí la fecha.\n"
                     "Por favor escribe una fecha como: 25 de junio o 25/06/2026."
@@ -1567,6 +2154,37 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
                 enviar_respuesta(numero, telefono_cliente, respuesta)
                 return {"status": "PEDIR_FECHA"}
 
+            if empresa.permite_citas_sin_hora:
+                respuesta = (
+                    f"Perfecto. Registré la fecha {fecha}.\n\n"
+                    "¿Deseas elegir una hora específica o agendar sin preferencia de horario?"
+                )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_TIPO_HORA",
+                    nombre=flujo.nombre,
+                    fecha=fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_botones_whatsapp(
+                    phone_number_id=numero.phone_number_id,
+                    token=numero.token,
+                    telefono_cliente=telefono_cliente,
+                    texto=respuesta,
+                    botones=[
+                        {"id": "HORA_ESPECIFICA", "title": "Hora específica"},
+                        {"id": "SIN_HORA_ESPECIFICA", "title": "Sin preferencia"},
+                    ],
+                )
+
+                return {"status": "PEDIR_TIPO_HORA"}
+
             respuesta = (
                 f"Perfecto. Registré la fecha {fecha}.\n\n¿A qué hora deseas tu cita?"
             )
@@ -1586,6 +2204,87 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
 
             enviar_respuesta(numero, telefono_cliente, respuesta)
             return {"status": "PEDIR_HORA"}
+
+        # =========================
+        # PEDIR TIPO DE HORA (sin hora específica)
+        # =========================
+        if flujo and flujo.paso == "PEDIR_TIPO_HORA":
+            if mensaje == "SIN_HORA_ESPECIFICA":
+                servicio = (
+                    db.query(Servicio).filter(Servicio.id == flujo.servicio_id).first()
+                )
+
+                try:
+                    crear_solicitud_sin_hora(
+                        db=db,
+                        empresa=empresa,
+                        servicio=servicio,
+                        fecha=flujo.fecha,
+                        nombre=flujo.nombre,
+                        telefono=telefono_cliente,
+                        canal="WHATSAPP",
+                        prestador_id=flujo.prestador_id,
+                    )
+                except ValueError as error:
+                    respuesta = f"No fue posible registrar tu solicitud: {error}."
+
+                    enviar_respuesta(numero, telefono_cliente, respuesta)
+                    return {"status": "ERROR_SIN_HORA"}
+
+                respuesta = (
+                    f"✅ Registré tu solicitud para el {flujo.fecha} sin hora específica.\n\n"
+                    "La empresa te confirmará el horario más adelante."
+                )
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                enviar_menu_principal(
+                    db=db,
+                    empresa=empresa,
+                    numero=numero,
+                    telefono_cliente=telefono_cliente,
+                )
+                return {"status": "SOLICITUD_SIN_HORA"}
+
+            if mensaje == "HORA_ESPECIFICA":
+                respuesta = "¿A qué hora deseas tu cita?"
+
+                guardar_conversacion(
+                    db=db,
+                    empresa_id=empresa.id,
+                    telefono_cliente=telefono_cliente,
+                    mensaje=mensaje,
+                    respuesta=respuesta,
+                    paso="PEDIR_HORA",
+                    nombre=flujo.nombre,
+                    fecha=flujo.fecha,
+                    servicio_id=flujo.servicio_id,
+                )
+
+                enviar_respuesta(numero, telefono_cliente, respuesta)
+                return {"status": "PEDIR_HORA"}
+
+            respuesta = "Por favor selecciona una de las opciones."
+
+            enviar_botones_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                texto=respuesta,
+                botones=[
+                    {"id": "HORA_ESPECIFICA", "title": "Hora específica"},
+                    {"id": "SIN_HORA_ESPECIFICA", "title": "Sin preferencia"},
+                ],
+            )
+
+            return {"status": "PEDIR_TIPO_HORA"}
 
         # =========================
         # PEDIR HORA
@@ -2032,7 +2731,77 @@ async def recibir_webhook(request: Request, db: Session = Depends(get_db)):
         # =========================
         # OPENAI NORMAL
         # =========================
-        # RESPUESTA DEFAULT SIN OPENAI
+        contexto_ia = construir_contexto_empresa(db, empresa)
+        resultado_ia = (
+            interpretar_mensaje(
+                empresa=empresa,
+                contexto=contexto_ia,
+                paso_actual=None,
+                mensaje_usuario=mensaje.strip(),
+            )
+            if tipo_mensaje == "text" and mensaje.strip()
+            else None
+        )
+
+        if resultado_ia and not resultado_ia.dentro_del_dominio:
+            respuesta = resultado_ia.mensaje_respuesta or (
+                f"Solo puedo ayudarte con información, servicios y citas de {empresa.nombre}."
+            )
+
+            enviar_respuesta(numero, telefono_cliente, respuesta)
+
+            return {"status": "FUERA_DE_CONTEXTO"}
+
+        if resultado_ia and resultado_ia.intencion == "AGENDAR":
+            iniciado = iniciar_agendado_desde_ia(
+                db=db,
+                empresa=empresa,
+                numero=numero,
+                telefono_cliente=telefono_cliente,
+                resultado_ia=resultado_ia,
+                mensaje_original=mensaje,
+            )
+
+            if iniciado:
+                return {"status": "AGENDAR_DESDE_IA"}
+
+            respuesta = (
+                "¡Con gusto! Para comenzar a agendar tu cita escribe "
+                '"agendar cita" o usa el botón del menú.'
+            )
+
+            enviar_respuesta(numero, telefono_cliente, respuesta)
+            enviar_menu_principal(
+                db=db,
+                empresa=empresa,
+                numero=numero,
+                telefono_cliente=telefono_cliente,
+            )
+
+            return {"status": "SUGERIR_AGENDAR"}
+
+        if (
+            resultado_ia
+            and resultado_ia.dentro_del_dominio
+            and resultado_ia.intencion != "NO_ENTENDIDO"
+        ):
+            respuesta = responder_pregunta_empresa(
+                empresa=empresa,
+                contexto=contexto_ia,
+                mensaje_usuario=mensaje.strip(),
+            )
+
+            enviar_respuesta(numero, telefono_cliente, respuesta)
+            enviar_menu_principal(
+                db=db,
+                empresa=empresa,
+                numero=numero,
+                telefono_cliente=telefono_cliente,
+            )
+
+            return {"status": "RESPUESTA_IA"}
+
+        # RESPUESTA DEFAULT SIN OPENAI (o si OpenAI no resolvió nada útil)
         respuesta = (
             "No entendí tu mensaje.\n\n"
             "Por favor usa el menú para continuar."

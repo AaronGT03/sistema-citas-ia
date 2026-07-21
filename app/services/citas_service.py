@@ -1,4 +1,4 @@
-from app.models import Cita, Servicio, Prestador
+from app.models import Cita, Servicio, Prestador, Empresa
 from app.models.prestador import prestadores_servicios
 from datetime import datetime, timedelta
 
@@ -51,22 +51,24 @@ def crear_cita(
     nombre: str,
     telefono: str,
     fecha: str,
-    hora: str,
+    hora: str | None,
     empresa_id: int,
     servicio_id: int | None = None,
     canal: str = "LLAMADA",
     prestador_id: int | None = None,
+    sin_hora_especifica: bool = False,
 ):
     nueva_cita = Cita(
         nombre=nombre,
         telefono=telefono,
         fecha=fecha,
         hora=hora,
-        status="AGENDADA",
+        status="PENDIENTE_HORA" if sin_hora_especifica else "AGENDADA",
         empresa_id=empresa_id,
         servicio_id=servicio_id,
         canal=canal,
         prestador_id=prestador_id,
+        sin_hora_especifica=sin_hora_especifica,
     )
 
     db.add(nueva_cita)
@@ -88,9 +90,10 @@ def reprogramar_cita(
     db,
     cita_anterior: Cita,
     nueva_fecha: str,
-    nueva_hora: str,
+    nueva_hora: str | None,
     canal: str = "LLAMADA",
     prestador_id: int | None = None,
+    sin_hora_especifica: bool = False,
 ):
     cita_anterior.status = "CANCELADA"
 
@@ -103,11 +106,12 @@ def reprogramar_cita(
         telefono=cita_anterior.telefono,
         fecha=nueva_fecha,
         hora=nueva_hora,
-        status="AGENDADA",
+        status="PENDIENTE_HORA" if sin_hora_especifica else "AGENDADA",
         empresa_id=cita_anterior.empresa_id,
         servicio_id=cita_anterior.servicio_id,
         canal=canal,
         prestador_id=prestador_final,
+        sin_hora_especifica=sin_hora_especifica,
     )
 
     db.add(nueva_cita)
@@ -310,3 +314,166 @@ def seleccionar_prestador_automaticamente(
     )
 
     return prestadores_disponibles[0]
+
+
+def crear_solicitud_sin_hora(
+    db,
+    empresa: Empresa,
+    servicio: Servicio,
+    fecha: str,
+    nombre: str,
+    telefono: str,
+    canal: str = "LLAMADA",
+    prestador_id: int | None = None,
+):
+    if not empresa.permite_citas_sin_hora:
+        raise ValueError("Esta empresa no permite citas sin hora específica")
+
+    if fecha_ya_paso(fecha):
+        raise ValueError("La fecha indicada ya pasó")
+
+    if prestador_id:
+        prestador = (
+            db.query(Prestador)
+            .filter(
+                Prestador.id == prestador_id,
+                Prestador.empresa_id == empresa.id,
+            )
+            .first()
+        )
+
+        if not prestador or not prestador.activo:
+            raise ValueError("Prestador no encontrado o inactivo")
+
+        if servicio not in prestador.servicios:
+            raise ValueError("El prestador seleccionado no realiza ese servicio")
+
+    return crear_cita(
+        db=db,
+        nombre=nombre,
+        telefono=telefono,
+        fecha=fecha,
+        hora=None,
+        empresa_id=empresa.id,
+        servicio_id=servicio.id,
+        canal=canal,
+        prestador_id=prestador_id,
+        sin_hora_especifica=True,
+    )
+
+
+def construir_contexto_empresa(db, empresa: Empresa):
+    servicios = (
+        db.query(Servicio)
+        .filter(Servicio.empresa_id == empresa.id, Servicio.activo == True)
+        .all()
+    )
+
+    prestadores = (
+        db.query(Prestador)
+        .filter(Prestador.empresa_id == empresa.id, Prestador.activo == True)
+        .all()
+    )
+
+    return {
+        "nombre": empresa.nombre,
+        "giro": empresa.giro,
+        "horario_inicio": empresa.horario_inicio,
+        "horario_fin": empresa.horario_fin,
+        "usa_prestadores": empresa.usa_prestadores,
+        "permite_citas_sin_hora": empresa.permite_citas_sin_hora,
+        "servicios": [
+            {
+                "id": servicio.id,
+                "nombre": servicio.nombre,
+                "descripcion": servicio.descripcion,
+                "duracion_minutos": servicio.duracion_minutos,
+                "precio": servicio.precio,
+            }
+            for servicio in servicios
+        ],
+        "prestadores": [
+            {
+                "id": prestador.id,
+                "nombre": prestador.nombre,
+                "descripcion": prestador.descripcion,
+                "servicios": [s.nombre for s in prestador.servicios],
+            }
+            for prestador in prestadores
+        ],
+    }
+
+
+# =====================================================================
+# Vocabulario por giro de negocio.
+#
+# El giro (Empresa.giro, texto libre) solo adapta CÓMO se habla con el
+# cliente: qué nombre se le da al prestador ("barbero", "doctor",
+# "asesor"...) y a la cita ("corte", "consulta", "visita"...). No cambia
+# ninguna lógica: internamente todo sigue siendo Prestador y Cita.
+# =====================================================================
+
+VOCABULARIO_POR_GIRO = [
+    # (palabras clave en el giro, prestador, prestador plural, término para la cita)
+    (("barber",), "barbero", "barberos", "cita"),
+    (("salón", "salon", "belleza", "estétic", "estetic", "spa"), "estilista", "estilistas", "cita"),
+    (("dentista", "dental", "odont"), "dentista", "dentistas", "cita"),
+    (("psicolog", "psicólog"), "psicólogo", "psicólogos", "sesión"),
+    (("veterinari",), "veterinario", "veterinarios", "consulta"),
+    (("consultorio", "médic", "medic", "clínic", "clinic", "doctor"), "doctor", "doctores", "consulta"),
+    (("taller", "mecánic", "mecanic"), "mecánico", "mecánicos", "revisión"),
+    (("agencia automotriz", "automotriz", "autos", "seminuevos"), "asesor", "asesores", "cita"),
+    (("bienes raíces", "bienes raices", "inmobiliari", "raíces", "raices"), "asesor", "asesores", "visita"),
+    (("abogad", "jurídic", "juridic", "legal"), "abogado", "abogados", "asesoría"),
+    (("contad", "contab", "fiscal"), "contador", "contadores", "asesoría"),
+    (("arquitect", "constructor"), "arquitecto", "arquitectos", "reunión"),
+    (("escuela", "colegio", "academia", "educa"), "asesor", "asesores", "cita"),
+    (("fotográf", "fotograf", "estudio foto"), "fotógrafo", "fotógrafos", "sesión"),
+    (("viaje", "turismo", "tour"), "agente", "agentes", "asesoría"),
+    (("gimnasio", "gym", "fitness", "entrena"), "entrenador", "entrenadores", "sesión"),
+]
+
+
+def vocabulario_por_giro(giro: str | None) -> dict:
+    """Devuelve los términos conversacionales para un giro dado. Si el giro
+    no coincide con ninguno conocido (o está vacío), usa términos genéricos
+    que funcionan para cualquier negocio."""
+    if giro:
+        giro_lower = giro.strip().lower()
+
+        for claves, prestador, prestador_plural, cita in VOCABULARIO_POR_GIRO:
+            if any(clave in giro_lower for clave in claves):
+                return {
+                    "prestador": prestador,
+                    "prestador_plural": prestador_plural,
+                    "cita": cita,
+                }
+
+    return {
+        "prestador": "profesional",
+        "prestador_plural": "profesionales",
+        "cita": "cita",
+    }
+
+
+def resolver_por_nombre(nombre_buscado: str | None, candidatos: list, atributo: str = "nombre"):
+    """Empareja un texto (ej. extraído por OpenAI) contra el nombre real de
+    una lista de objetos (Servicio, Prestador, etc.) de forma tolerante:
+    primero coincidencia exacta, luego coincidencia parcial en cualquier
+    dirección. Devuelve None si no hay ningún candidato razonable — nunca
+    inventa una coincidencia."""
+    if not nombre_buscado:
+        return None
+
+    buscado = nombre_buscado.strip().lower()
+
+    for candidato in candidatos:
+        if getattr(candidato, atributo).strip().lower() == buscado:
+            return candidato
+
+    for candidato in candidatos:
+        valor = getattr(candidato, atributo).strip().lower()
+        if buscado in valor or valor in buscado:
+            return candidato
+
+    return None

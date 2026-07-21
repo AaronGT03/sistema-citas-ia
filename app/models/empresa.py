@@ -23,3 +23,9 @@ class Empresa(Base):
         default=False,
         nullable=False,
     )
+
+    permite_citas_sin_hora = Column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )

@@ -7,6 +7,8 @@ from app.dependencies import obtener_usuario_actual
 from app.services.citas_service import (
     horario_choca_con_duracion,
     seleccionar_prestador_automaticamente,
+    crear_solicitud_sin_hora,
+    reprogramar_cita as reprogramar_cita_service,
 )
 
 router = APIRouter()
@@ -17,8 +19,9 @@ def crear_cita(
     nombre: str,
     telefono: str,
     fecha: str,
-    hora: str,
     servicio_id: int,
+    hora: str | None = None,
+    sin_hora_especifica: bool = False,
     prestador_id: int | None = None,
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
@@ -44,6 +47,32 @@ def crear_cita(
 
     if not servicio:
         raise HTTPException(status_code=404, detail="Servicio no encontrado")
+
+    if sin_hora_especifica:
+        try:
+            nueva_cita_sin_hora = crear_solicitud_sin_hora(
+                db=db,
+                empresa=empresa,
+                servicio=servicio,
+                fecha=fecha,
+                nombre=nombre,
+                telefono=telefono,
+                canal="DASHBOARD",
+                prestador_id=prestador_id,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+
+        return {
+            "mensaje": "Solicitud registrada sin hora específica",
+            "cita": nueva_cita_sin_hora,
+        }
+
+    if hora is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Debe indicar una hora o marcar sin_hora_especifica",
+        )
 
     prestador_final = None
 
@@ -169,6 +198,7 @@ def listar_citas(
                 "telefono": cita.telefono,
                 "fecha": cita.fecha,
                 "hora": cita.hora,
+                "sin_hora_especifica": cita.sin_hora_especifica,
                 "status": cita.status,
                 "canal": cita.canal,
                 "empresa_id": cita.empresa_id,
@@ -242,7 +272,8 @@ def cancelar_cita(
 def reprogramar_cita(
     cita_id: int,
     nueva_fecha: str,
-    nueva_hora: str,
+    nueva_hora: str | None = None,
+    sin_hora_especifica: bool = False,
     nuevo_prestador_id: int | None = None,
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
@@ -273,6 +304,33 @@ def reprogramar_cita(
 
         if not prestador or not prestador.activo:
             return {"error": "Prestador no encontrado o inactivo"}
+
+    if sin_hora_especifica:
+        empresa = (
+            db.query(Empresa).filter(Empresa.id == cita_anterior.empresa_id).first()
+        )
+
+        if not empresa or not empresa.permite_citas_sin_hora:
+            return {"error": "Esta empresa no permite citas sin hora específica"}
+
+        nueva_cita_sin_hora = reprogramar_cita_service(
+            db=db,
+            cita_anterior=cita_anterior,
+            nueva_fecha=nueva_fecha,
+            nueva_hora=None,
+            canal=cita_anterior.canal,
+            prestador_id=prestador_id_final,
+            sin_hora_especifica=True,
+        )
+
+        return {
+            "mensaje": "Cita reprogramada sin hora específica",
+            "cita_cancelada_id": cita_anterior.id,
+            "nueva_cita": nueva_cita_sin_hora,
+        }
+
+    if nueva_hora is None:
+        return {"error": "Debe indicar una nueva hora o marcar sin_hora_especifica"}
 
     ocupado = horario_choca_con_duracion(
         db=db,

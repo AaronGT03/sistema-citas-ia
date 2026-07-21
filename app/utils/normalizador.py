@@ -56,7 +56,7 @@ def _obtener_numero(texto: str):
     texto = texto.lower()
 
     for palabra in sorted(NUMEROS, key=len, reverse=True):
-        if palabra in texto:
+        if re.search(rf"\b{re.escape(palabra)}\b", texto):
             return NUMEROS[palabra]
 
     for parte in re.findall(r"\d+", texto):
@@ -177,3 +177,30 @@ def normalizar_hora(texto: str) -> str | None:
         return None
 
     return f"{hora:02d}:{minutos:02d}"
+
+
+def normalizar_fecha_iso(fecha_texto: str) -> str | None:
+    """Convierte una fecha en formato ISO (YYYY-MM-DD, como la que devuelve
+    OpenAI) al formato DD/MM/YYYY usado internamente. Devuelve None si el
+    texto no es una fecha ISO válida."""
+    if not fecha_texto:
+        return None
+
+    try:
+        fecha = datetime.strptime(fecha_texto.strip(), "%Y-%m-%d")
+        return fecha.strftime("%d/%m/%Y")
+    except ValueError:
+        return None
+
+
+def normalizar_hora_valida(hora_texto: str) -> str | None:
+    """Valida que un texto ya tenga el formato HH:MM (24h) usado internamente.
+    Devuelve el mismo valor si es válido, o None si no lo es."""
+    if not hora_texto:
+        return None
+
+    try:
+        datetime.strptime(hora_texto.strip(), "%H:%M")
+        return hora_texto.strip()
+    except ValueError:
+        return None

@@ -11,10 +11,12 @@ class Cita(Base):
     nombre = Column(String)
     telefono = Column(String)
     fecha = Column(String)
-    hora = Column(String)
+    hora = Column(String, nullable=True)
 
     status = Column(String, default="AGENDADA")
     canal = Column(String, default="LLAMADA")
+
+    sin_hora_especifica = Column(Boolean, default=False, nullable=False)
 
     recordatorio_enviado = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -4,7 +4,13 @@ from fastapi.responses import Response
 
 from app.database import get_db
 from app.models import Cita, Conversacion, Empresa, Servicio, Prestador
-from app.utils import normalizar_fecha, normalizar_hora, normalizar_telefono_mexico
+from app.utils import (
+    normalizar_fecha,
+    normalizar_hora,
+    normalizar_telefono_mexico,
+    normalizar_fecha_iso,
+    normalizar_hora_valida,
+)
 from app.services.citas_service import (
     existe_cita_en_horario,
     crear_cita,
@@ -16,7 +22,11 @@ from app.services.citas_service import (
     obtener_horarios_disponibles,
     obtener_prestadores_compatibles,
     seleccionar_prestador_automaticamente,
+    crear_solicitud_sin_hora,
+    construir_contexto_empresa,
+    resolver_por_nombre,
 )
+from app.services.openai_service import interpretar_mensaje, responder_pregunta_empresa
 
 router = APIRouter()
 
@@ -25,7 +35,7 @@ router = APIRouter()
 def respuesta_horario_ocupado():
     twiml = """
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Ya existe una cita programada para esa fecha y hora.
         Por favor seleccione otro horario.
     </Say>
@@ -40,7 +50,7 @@ def respuesta_prestador_ocupado(alternativas=None):
     if alternativas:
         horas_texto = ", ".join(alternativas[:3])
         mensaje_alternativas = f"""
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Los horarios disponibles más cercanos son: {horas_texto}.
         Por favor vuelva a llamar para agendar en uno de esos horarios.
     </Say>
@@ -48,7 +58,7 @@ def respuesta_prestador_ocupado(alternativas=None):
 
     twiml = f"""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Ese profesional no está disponible en ese horario.
     </Say>
 {mensaje_alternativas}
@@ -63,7 +73,7 @@ def respuesta_sin_prestadores(alternativas=None):
     if alternativas:
         horas_texto = ", ".join(alternativas[:3])
         mensaje_alternativas = f"""
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Los horarios disponibles más cercanos son: {horas_texto}.
         Por favor vuelva a llamar para agendar en uno de esos horarios.
     </Say>
@@ -71,13 +81,764 @@ def respuesta_sin_prestadores(alternativas=None):
 
     twiml = f"""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No hay profesionales disponibles en ese horario.
     </Say>
 {mensaje_alternativas}
 </Response>
 """
     return Response(content=twiml, media_type="application/xml")
+
+
+# =====================================================================
+# Arranque del flujo de agendado a partir de datos ya extraídos por
+# OpenAI (frase natural completa tipo "quiero un corte con Jeremy hoy a
+# las 4"). Reutiliza exactamente las mismas funciones de validación de
+# app/services/citas_service.py que usa el flujo determinístico paso a
+# paso — nunca crea una cita sin pasar por esas validaciones. El estado
+# de qué falta se guarda en Conversacion.paso="AGENDAR_IA", usando
+# Conversacion.mensaje (que este archivo no usa para nada más) como
+# marcador interno de qué sub-pregunta está pendiente.
+# =====================================================================
+
+def _validar_y_guardar_hora_ia(db: Session, empresa: Empresa, flujo: Conversacion, hora: str, telefono: str):
+    """Valida una hora ya normalizada contra hora_ya_paso y el horario de
+    atención de la empresa. Si es válida, la guarda en flujo y devuelve
+    None (el llamador continúa con el flujo). Si no, devuelve el TwiML de
+    reintento correspondiente."""
+
+    if hora_ya_paso(flujo.fecha, hora):
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Esa hora ya pasó.
+            Por favor indique una hora futura.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Lo sentimos.
+            El horario de atención es de {empresa.horario_inicio} a {empresa.horario_fin}.
+            Por favor indique otra hora.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    flujo.hora = hora
+    flujo.mensaje = None
+    db.commit()
+
+    return None
+
+
+def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str, flujo: Conversacion, servicio: Servicio):
+    """Con el estado actual de flujo (nombre/fecha/hora/prestador ya
+    conocidos o no), decide qué preguntar a continuación en el mismo
+    orden que el flujo determinístico, o crea la cita si ya se sabe todo."""
+
+    if empresa.usa_prestadores and not flujo.prestador_id and not flujo.asignacion_automatica:
+        flujo.mensaje = "ESPERANDO_TIPO_PRESTADOR"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Para su {servicio.nombre},
+            ¿desea atenderse con un profesional específico o con cualquiera disponible?
+            Presione 1 para elegir un profesional.
+            Presione 2 para atenderse con cualquier profesional disponible.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    if not flujo.nombre:
+        flujo.mensaje = "ESPERANDO_NOMBRE"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            ¿Cuál es su nombre completo?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    if not flujo.fecha:
+        flujo.mensaje = "ESPERANDO_FECHA"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Gracias {flujo.nombre}. ¿Qué fecha desea para su cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    if not flujo.hora and not flujo.sin_hora_especifica:
+        if empresa.permite_citas_sin_hora:
+            flujo.mensaje = "ESPERANDO_TIPO_HORA"
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Puede elegir una hora específica o indicar que no tiene preferencia de horario.
+            Presione 1 para elegir una hora específica.
+            Presione 2 para agendar sin hora específica.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        else:
+            flujo.mensaje = "ESPERANDO_HORA"
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Perfecto. ¿A qué hora desea la cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    # ---- Ya se conoce todo lo necesario: crear la cita ----
+
+    if flujo.sin_hora_especifica:
+        try:
+            crear_solicitud_sin_hora(
+                db=db,
+                empresa=empresa,
+                servicio=servicio,
+                fecha=flujo.fecha,
+                nombre=flujo.nombre,
+                telefono=telefono,
+                canal="LLAMADA",
+                prestador_id=flujo.prestador_id,
+            )
+        except ValueError as error:
+            db.delete(flujo)
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Say language="es-MX" voice="Polly.Mia-Neural">
+        No fue posible registrar su solicitud: {error}.
+    </Say>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        fecha_confirmada = flujo.fecha
+
+        db.delete(flujo)
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Say language="es-MX" voice="Polly.Mia-Neural">
+        Perfecto. Registraré su solicitud para el día {fecha_confirmada} sin una hora específica.
+        La empresa podrá asignar el horario posteriormente.
+        Gracias por usar nuestro sistema de citas.
+    </Say>
+</Response>
+"""
+        return Response(content=twiml, media_type="application/xml")
+
+    prestador_final = flujo.prestador_id
+    horarios_alternativos = None
+    cita_ocupada = False
+
+    if empresa.usa_prestadores:
+        if flujo.prestador_id:
+            cita_ocupada = horario_choca_con_duracion(
+                db=db,
+                empresa_id=empresa.id,
+                fecha=flujo.fecha,
+                hora=flujo.hora,
+                servicio_id=servicio.id,
+                prestador_id=flujo.prestador_id,
+            )
+
+            if cita_ocupada:
+                horarios_alternativos = obtener_horarios_disponibles(
+                    db=db,
+                    empresa=empresa,
+                    fecha=flujo.fecha,
+                    servicio_id=servicio.id,
+                    prestador_id=flujo.prestador_id,
+                )
+        else:
+            prestador_seleccionado = seleccionar_prestador_automaticamente(
+                db=db,
+                empresa_id=empresa.id,
+                servicio_id=servicio.id,
+                fecha=flujo.fecha,
+                hora=flujo.hora,
+            )
+
+            if not prestador_seleccionado:
+                cita_ocupada = True
+                horarios_alternativos = obtener_horarios_disponibles(
+                    db=db, empresa=empresa, fecha=flujo.fecha, servicio_id=servicio.id,
+                )
+            else:
+                prestador_final = prestador_seleccionado.id
+    else:
+        cita_ocupada = horario_choca_con_duracion(
+            db=db,
+            empresa_id=empresa.id,
+            fecha=flujo.fecha,
+            hora=flujo.hora,
+            servicio_id=servicio.id,
+        )
+
+        if cita_ocupada:
+            horarios_alternativos = obtener_horarios_disponibles(
+                db=db, empresa=empresa, fecha=flujo.fecha
+            )
+
+    if cita_ocupada:
+        if flujo.prestador_id:
+            respuesta_final = respuesta_prestador_ocupado(horarios_alternativos)
+        elif empresa.usa_prestadores:
+            respuesta_final = respuesta_sin_prestadores(horarios_alternativos)
+        else:
+            respuesta_final = respuesta_horario_ocupado()
+
+        db.delete(flujo)
+        db.commit()
+
+        return respuesta_final
+
+    cita = crear_cita(
+        db=db,
+        nombre=flujo.nombre,
+        telefono=telefono,
+        fecha=flujo.fecha,
+        hora=flujo.hora,
+        empresa_id=empresa.id,
+        servicio_id=servicio.id,
+        canal="LLAMADA",
+        prestador_id=prestador_final,
+    )
+
+    db.delete(flujo)
+    db.commit()
+
+    twiml = f"""
+<Response>
+    <Say language="es-MX" voice="Polly.Mia-Neural">
+        Perfecto {cita.nombre}.
+        Su cita fue agendada para el día {cita.fecha}
+        a las {cita.hora} horas.
+        Gracias por usar nuestro sistema de citas.
+    </Say>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+def _continuar_agendado_ia_llamada(
+    db: Session,
+    empresa: Empresa,
+    telefono: str,
+    flujo: Conversacion,
+    digits: str,
+    speech: str,
+):
+    servicio = db.query(Servicio).filter(Servicio.id == flujo.servicio_id).first()
+    marcador = flujo.mensaje
+
+    if marcador == "ESPERANDO_TIPO_PRESTADOR":
+        opcion = digits.strip()
+
+        if opcion == "2":
+            flujo.asignacion_automatica = True
+            flujo.mensaje = None
+            db.commit()
+        elif opcion == "1":
+            prestadores = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+
+            if not prestadores:
+                flujo.asignacion_automatica = True
+                flujo.mensaje = None
+                db.commit()
+            else:
+                lista_prestadores = ""
+
+                for i, prestador in enumerate(prestadores, start=1):
+                    lista_prestadores += f"""
+            <Say language="es-MX" voice="Polly.Mia-Neural">
+                {i}. {prestador.nombre}
+            </Say>
+            """
+
+                flujo.mensaje = "ESPERANDO_PRESTADOR_ESPECIFICO"
+                db.commit()
+
+                twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/agendar-ia-continuar?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Seleccione uno de los siguientes profesionales.
+        </Say>
+
+        {lista_prestadores}
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Presione en su teléfono el número del profesional que desea.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+                return Response(content=twiml, media_type="application/xml")
+        else:
+            twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            No entendí su respuesta.
+            Presione 1 para elegir un profesional.
+            Presione 2 para atenderse con cualquier profesional disponible.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+    elif marcador == "ESPERANDO_PRESTADOR_ESPECIFICO":
+        prestadores = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+        opcion = digits.strip()
+        prestador_seleccionado = None
+
+        if opcion.isdigit():
+            indice = int(opcion) - 1
+
+            if 0 <= indice < len(prestadores):
+                prestador_seleccionado = prestadores[indice]
+
+        if not prestador_seleccionado:
+            lista_prestadores = ""
+
+            for i, prestador in enumerate(prestadores, start=1):
+                lista_prestadores += f"""
+            <Say language="es-MX" voice="Polly.Mia-Neural">
+                {i}. {prestador.nombre}
+            </Say>
+            """
+
+            twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/agendar-ia-continuar?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        No encontré ese profesional. Por favor presione un número válido.
+
+        {lista_prestadores}
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        flujo.prestador_id = prestador_seleccionado.id
+        flujo.asignacion_automatica = False
+        flujo.mensaje = None
+        db.commit()
+
+    elif marcador == "ESPERANDO_NOMBRE":
+        nombre_limpio = speech.strip()
+
+        if not nombre_limpio:
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            ¿Cuál es su nombre completo?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        flujo.nombre = nombre_limpio
+        flujo.mensaje = None
+        db.commit()
+
+    elif marcador == "ESPERANDO_FECHA":
+        fecha = normalizar_fecha(speech.strip())
+
+        if fecha is None:
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        if fecha_ya_paso(fecha):
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            La fecha indicada ya pasó.
+            Por favor indique una fecha futura.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        flujo.fecha = fecha
+        flujo.mensaje = None
+        db.commit()
+
+    elif marcador == "ESPERANDO_TIPO_HORA":
+        opcion = digits.strip()
+
+        if opcion == "2":
+            flujo.sin_hora_especifica = True
+            flujo.mensaje = None
+            db.commit()
+        elif opcion == "1":
+            flujo.mensaje = "ESPERANDO_HORA"
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            ¿A qué hora desea la cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+        else:
+            twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            No entendí su respuesta.
+            Presione 1 para elegir una hora específica.
+            Presione 2 para agendar sin hora específica.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+    elif marcador == "ESPERANDO_HORA_ACLARACION":
+        hora_original = flujo.hora or ""
+        respuesta_texto = speech.lower().strip()
+
+        try:
+            numero_hora = int("".join(filter(str.isdigit, hora_original)))
+        except ValueError:
+            flujo.mensaje = "ESPERANDO_HORA"
+            flujo.hora = None
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            No pude identificar la hora. ¿A qué hora desea la cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        if "tarde" in respuesta_texto or "noche" in respuesta_texto:
+            hora_final = f"{numero_hora + 12:02d}:00"
+        else:
+            hora_final = f"{numero_hora:02d}:00"
+
+        resultado_hora = _validar_y_guardar_hora_ia(db, empresa, flujo, hora_final, telefono)
+
+        if resultado_hora is not None:
+            return resultado_hora
+
+    elif marcador == "ESPERANDO_HORA":
+        hora = normalizar_hora(speech.strip())
+
+        if hora == "AMBIGUA":
+            flujo.hora = speech.strip()
+            flujo.mensaje = "ESPERANDO_HORA_ACLARACION"
+            db.commit()
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            ¿Se refiere a las {speech} de la mañana o de la tarde?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        if hora is None:
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/agendar-ia-continuar?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            No entendí la hora. Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        resultado_hora = _validar_y_guardar_hora_ia(db, empresa, flujo, hora, telefono)
+
+        if resultado_hora is not None:
+            return resultado_hora
+
+    return _preguntar_siguiente_o_crear_ia(db, empresa, telefono, flujo, servicio)
+
+
+def iniciar_agendado_desde_ia_llamada(
+    db: Session,
+    empresa: Empresa,
+    empresa_id: int,
+    telefono: str,
+    resultado_ia,
+    mensaje_original: str,
+):
+    """Punto de entrada desde /procesar-agenda. Devuelve None si no pudo
+    resolver ni siquiera el servicio contra el catálogo real de la
+    empresa (el llamador debe usar el TwiML genérico de "no entendí").
+    Si devuelve una Response, ya es la respuesta TwiML completa (con la
+    siguiente pregunta que falte, o la cita ya creada)."""
+
+    servicios_activos = (
+        db.query(Servicio)
+        .filter(Servicio.empresa_id == empresa_id, Servicio.activo == True)
+        .all()
+    )
+
+    servicio = resolver_por_nombre(resultado_ia.servicio, servicios_activos)
+
+    if not servicio:
+        return None
+
+    conversacion_existente = (
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+    )
+
+    if conversacion_existente:
+        db.delete(conversacion_existente)
+        db.commit()
+
+    nombre = resultado_ia.nombre.strip() if resultado_ia.nombre else None
+
+    fecha = None
+    if resultado_ia.fecha:
+        fecha_candidata = normalizar_fecha_iso(resultado_ia.fecha) or normalizar_fecha(
+            resultado_ia.fecha
+        )
+        if fecha_candidata and not fecha_ya_paso(fecha_candidata):
+            fecha = fecha_candidata
+
+    sin_hora = bool(resultado_ia.sin_hora_especifica and empresa.permite_citas_sin_hora)
+
+    hora = None
+    if not sin_hora and resultado_ia.hora:
+        hora = normalizar_hora_valida(resultado_ia.hora)
+
+    prestador_id = None
+    asignacion_automatica = False
+
+    if empresa.usa_prestadores:
+        if resultado_ia.cualquier_prestador:
+            asignacion_automatica = True
+        elif resultado_ia.prestador:
+            prestadores_compatibles = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+            prestador = resolver_por_nombre(resultado_ia.prestador, prestadores_compatibles)
+
+            if prestador:
+                prestador_id = prestador.id
+
+    flujo = Conversacion(
+        telefono=telefono,
+        empresa_id=empresa_id,
+        canal="LLAMADA",
+        paso="AGENDAR_IA",
+        nombre=nombre,
+        fecha=fecha,
+        hora=hora,
+        servicio_id=servicio.id,
+        prestador_id=prestador_id,
+        asignacion_automatica=asignacion_automatica,
+        sin_hora_especifica=sin_hora,
+    )
+
+    db.add(flujo)
+    db.commit()
+    db.refresh(flujo)
+
+    return _preguntar_siguiente_o_crear_ia(db, empresa, telefono, flujo, servicio)
 
 
 @router.post("/llamada")
@@ -99,7 +860,7 @@ async def llamada(
     if not empresa:
         twiml = """
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Este número no tiene una empresa configurada.
     </Say>
 </Response>
@@ -127,20 +888,20 @@ async def llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Hola {cita.nombre}. Encontré una cita agendada para usted en {empresa.nombre}.
         </Say>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Su cita es el día {cita.fecha} a las {cita.hora}.
         </Say>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Diga cancelar o reprogramar.
         </Say>
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí ninguna respuesta. Intente nuevamente.
     </Say>
 </Response>
@@ -156,15 +917,15 @@ async def llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Hola, bienvenido a {empresa.nombre}.
         </Say>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No encontré ninguna cita activa.
         </Say>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Si desea agendar una cita diga agendar.
         </Say>
     </Gather>
@@ -199,7 +960,7 @@ async def procesar_cita(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré ninguna cita activa.
     </Say>
 </Response>
@@ -212,7 +973,7 @@ async def procesar_cita(
 
         twiml = """
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Su cita ha sido cancelada correctamente.
         Si desea agendar una nueva cita, por favor vuelva a llamar.
     </Say>
@@ -252,14 +1013,14 @@ async def procesar_cita(
 
             if cita.prestador_id:
                 mensaje_opciones = """
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Presione 1 para mantener a su mismo profesional.
             Presione 2 para elegir otro profesional.
         </Say>
 """
             else:
                 mensaje_opciones = """
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             ¿Desea atenderse con un profesional específico?
             Presione 1 para elegir un profesional.
             Presione 2 para atenderse con cualquier profesional disponible.
@@ -290,7 +1051,7 @@ async def procesar_cita(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?
         </Say>
 
@@ -303,7 +1064,7 @@ async def procesar_cita(
     return Response(
         content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No entendí su respuesta.
     </Say>
 </Response>
@@ -330,12 +1091,7 @@ async def procesar_agenda(
     print(f"Teléfono: {telefono}")
     print(f"Respuesta usuario: {respuesta}")
 
-    if (
-        "agendar" in respuesta
-        or "agenda" in respuesta
-        or "agéndar" in respuesta
-        or "en" in respuesta
-    ):
+    def _iniciar_flujo_determinista_servicio():
         conversacion_existente = (
             db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
         )
@@ -360,7 +1116,7 @@ async def procesar_agenda(
 
         for i, servicio in enumerate(servicios, start=1):
             lista_servicios += f"""
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 {i}. {servicio.nombre}
             </Say>
             """
@@ -375,14 +1131,14 @@ async def procesar_agenda(
     method="POST"
     timeout="10">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto.
             Seleccione uno de los siguientes servicios.
         </Say>
 
         {lista_servicios}
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
     Presione en su teléfono el número del servicio que desea.
 </Say>
 
@@ -393,9 +1149,90 @@ async def procesar_agenda(
 
         return Response(content=twiml, media_type="application/xml")
 
+    empresa_para_ia = db.query(Empresa).filter(Empresa.id == empresa_id).first()
+
+    # La IA tiene prioridad sobre el disparador por palabra clave: se
+    # intenta primero interpretar el mensaje completo con OpenAI. El
+    # disparador determinístico ("agendar"/"agenda"/"en") queda como
+    # respaldo únicamente para cuando OpenAI no está disponible o no
+    # devolvió nada (resultado_ia is None) — así la llamada nunca depende
+    # por completo de un servicio externo.
+    resultado_ia = None
+
+    if empresa_para_ia and respuesta:
+        contexto = construir_contexto_empresa(db, empresa_para_ia)
+        resultado_ia = interpretar_mensaje(
+            empresa=empresa_para_ia,
+            contexto=contexto,
+            paso_actual=None,
+            mensaje_usuario=SpeechResult.strip(),
+        )
+
+        if resultado_ia and resultado_ia.dentro_del_dominio and resultado_ia.intencion == "AGENDAR":
+            respuesta_ia = iniciar_agendado_desde_ia_llamada(
+                db=db,
+                empresa=empresa_para_ia,
+                empresa_id=empresa_id,
+                telefono=telefono,
+                resultado_ia=resultado_ia,
+                mensaje_original=SpeechResult.strip(),
+            )
+
+            if respuesta_ia is not None:
+                return respuesta_ia
+
+            # La IA detectó intención de agendar pero no logró reconocer
+            # ningún servicio real (ej. el cliente solo dijo "quiero
+            # agendar" sin más detalle) — continúa con el flujo clásico de
+            # elegir servicio por número, igual que si hubiera disparado
+            # por palabra clave.
+            return _iniciar_flujo_determinista_servicio()
+
+        if resultado_ia and resultado_ia.dentro_del_dominio and resultado_ia.intencion not in (
+            "FUERA_DE_CONTEXTO",
+            "NO_ENTENDIDO",
+        ):
+            texto_respuesta = responder_pregunta_empresa(
+                empresa=empresa_para_ia,
+                contexto=contexto,
+                mensaje_usuario=SpeechResult.strip(),
+            )
+
+            twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/procesar-agenda?telefono={telefono}&amp;empresa_id={empresa_id}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            {texto_respuesta}
+        </Say>
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Si desea agendar una cita, dígalo cuando guste.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+
+            return Response(content=twiml, media_type="application/xml")
+
+    if resultado_ia is None and (
+        "agendar" in respuesta
+        or "agenda" in respuesta
+        or "agéndar" in respuesta
+        or "en" in respuesta
+    ):
+        return _iniciar_flujo_determinista_servicio()
+
     twiml = """
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No entendí su respuesta.
     </Say>
 </Response>
@@ -425,7 +1262,7 @@ async def guardar_nombre(
     if not conversacion:
         twiml = """
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa. Intente llamar nuevamente.
     </Say>
 </Response>
@@ -447,13 +1284,13 @@ async def guardar_nombre(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Gracias {nombre}. ¿Qué fecha desea para su cita?
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí la fecha. Intente nuevamente.
     </Say>
 </Response>
@@ -479,7 +1316,7 @@ async def guardar_servicio(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa. Intente llamar nuevamente.
     </Say>
 </Response>
@@ -505,7 +1342,7 @@ async def guardar_servicio(
 
         for i, servicio in enumerate(servicios, start=1):
             lista_servicios += f"""
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 {i}. {servicio.nombre}
             </Say>
             """
@@ -546,11 +1383,11 @@ async def guardar_servicio(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto, seleccionó {servicio_seleccionado.nombre}.
         </Say>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             ¿Desea atenderse con un profesional específico?
             Presione 1 para elegir un profesional.
             Presione 2 para atenderse con cualquier profesional disponible.
@@ -576,14 +1413,14 @@ async def guardar_servicio(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto, seleccionó {servicio_seleccionado.nombre}.
             ¿Cuál es su nombre completo?
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí su nombre. Intente nuevamente.
     </Say>
 </Response>
@@ -608,7 +1445,7 @@ async def guardar_tipo_prestador(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa. Intente llamar nuevamente.
     </Say>
 </Response>
@@ -634,14 +1471,14 @@ async def guardar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto, se atenderá con cualquier profesional disponible.
             ¿Cuál es su nombre completo?
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí su nombre. Intente nuevamente.
     </Say>
 </Response>
@@ -669,7 +1506,7 @@ async def guardar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Por el momento no hay profesionales específicos disponibles para ese servicio.
             Le atenderá cualquier profesional disponible.
             ¿Cuál es su nombre completo?
@@ -684,7 +1521,7 @@ async def guardar_tipo_prestador(
 
         for i, prestador in enumerate(prestadores, start=1):
             lista_prestadores += f"""
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 {i}. {prestador.nombre}
             </Say>
             """
@@ -701,13 +1538,13 @@ async def guardar_tipo_prestador(
     method="POST"
     timeout="10">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Seleccione uno de los siguientes profesionales.
         </Say>
 
         {lista_prestadores}
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Presione en su teléfono el número del profesional que desea.
         </Say>
 
@@ -725,7 +1562,7 @@ async def guardar_tipo_prestador(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No entendí su respuesta.
             Presione 1 para elegir un profesional.
             Presione 2 para atenderse con cualquier profesional disponible.
@@ -753,7 +1590,7 @@ async def guardar_prestador(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa. Intente llamar nuevamente.
     </Say>
 </Response>
@@ -779,7 +1616,7 @@ async def guardar_prestador(
 
         for i, prestador in enumerate(prestadores, start=1):
             lista_prestadores += f"""
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 {i}. {prestador.nombre}
             </Say>
             """
@@ -818,14 +1655,14 @@ async def guardar_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto, se atenderá con {prestador_seleccionado.nombre}.
             ¿Cuál es su nombre completo?
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí su nombre. Intente nuevamente.
     </Say>
 </Response>
@@ -851,7 +1688,7 @@ async def guardar_fecha(
             action="/guardar-fecha?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 La fecha indicada ya pasó.
                 Por favor indique una fecha futura.
             </Say>
@@ -862,7 +1699,34 @@ async def guardar_fecha(
         return Response(content=twiml, media_type="application/xml")
 
     if fecha is None:
-        twiml = f"""
+        conversacion_para_ia = (
+            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+        )
+        empresa_para_ia = (
+            db.query(Empresa).filter(Empresa.id == conversacion_para_ia.empresa_id).first()
+            if conversacion_para_ia
+            else None
+        )
+
+        if empresa_para_ia:
+            contexto = construir_contexto_empresa(db, empresa_para_ia)
+            resultado_ia = interpretar_mensaje(
+                empresa=empresa_para_ia,
+                contexto=contexto,
+                paso_actual="PEDIR_FECHA",
+                mensaje_usuario=SpeechResult.strip(),
+            )
+
+            if resultado_ia and resultado_ia.fecha:
+                fecha_ia = normalizar_fecha_iso(resultado_ia.fecha) or normalizar_fecha(
+                    resultado_ia.fecha
+                )
+
+                if fecha_ia and not fecha_ya_paso(fecha_ia):
+                    fecha = fecha_ia
+
+        if fecha is None:
+            twiml = f"""
 <Response>
     <Gather
         input="speech"
@@ -872,7 +1736,7 @@ async def guardar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
         </Say>
 
@@ -880,7 +1744,7 @@ async def guardar_fecha(
 </Response>
 """
 
-        return Response(content=twiml, media_type="application/xml")
+            return Response(content=twiml, media_type="application/xml")
 
     print("ENTRO A GUARDAR_FECHA")
     print(f"Fecha recibida: {fecha}")
@@ -893,7 +1757,7 @@ async def guardar_fecha(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa.
     </Say>
 </Response>
@@ -902,6 +1766,35 @@ async def guardar_fecha(
         )
 
     conversacion.fecha = fecha
+
+    empresa_actual = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+
+    if empresa_actual and empresa_actual.permite_citas_sin_hora:
+        conversacion.paso = "PEDIR_TIPO_HORA"
+
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/guardar-tipo-hora?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Puede elegir una hora específica o indicar que no tiene preferencia de horario.
+            Presione 1 para elegir una hora específica.
+            Presione 2 para agendar sin hora específica.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+
+        return Response(content=twiml, media_type="application/xml")
+
     conversacion.paso = "PEDIR_HORA"
 
     db.commit()
@@ -916,7 +1809,7 @@ async def guardar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto. ¿A qué hora desea la cita?
         </Say>
 
@@ -925,6 +1818,156 @@ async def guardar_fecha(
 """
 
     return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/guardar-tipo-hora")
+async def guardar_tipo_hora(
+    telefono: str,
+    Digits: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
+
+    conversacion = (
+        db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+    )
+
+    if not conversacion:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX" voice="Polly.Mia-Neural">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
+
+    opcion = Digits.strip()
+
+    if opcion == "2":
+        empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
+        servicio = (
+            db.query(Servicio).filter(Servicio.id == conversacion.servicio_id).first()
+        )
+
+        try:
+            crear_solicitud_sin_hora(
+                db=db,
+                empresa=empresa,
+                servicio=servicio,
+                fecha=conversacion.fecha,
+                nombre=conversacion.nombre,
+                telefono=telefono,
+                canal="LLAMADA",
+                prestador_id=conversacion.prestador_id,
+            )
+        except ValueError as error:
+            return Response(
+                content=f"""
+<Response>
+    <Say language="es-MX" voice="Polly.Mia-Neural">
+        No fue posible registrar su solicitud: {error}.
+    </Say>
+</Response>
+""",
+                media_type="application/xml",
+            )
+
+        db.delete(conversacion)
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Say language="es-MX" voice="Polly.Mia-Neural">
+        Perfecto. Registraré su solicitud para el día {conversacion.fecha} sin una hora específica.
+        La empresa podrá asignar el horario posteriormente.
+        Gracias por usar nuestro sistema de citas.
+    </Say>
+</Response>
+"""
+
+        return Response(content=twiml, media_type="application/xml")
+
+    if opcion == "1":
+        conversacion.paso = "PEDIR_HORA"
+        db.commit()
+
+        twiml = f"""
+<Response>
+    <Gather
+        input="speech"
+        language="es-MX"
+        action="/guardar-hora?telefono={telefono}"
+        method="POST"
+        timeout="8"
+        speechTimeout="auto">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Perfecto. ¿A qué hora desea la cita?
+        </Say>
+
+    </Gather>
+</Response>
+"""
+
+        return Response(content=twiml, media_type="application/xml")
+
+    twiml = f"""
+<Response>
+    <Gather
+        input="dtmf"
+        numDigits="1"
+        action="/guardar-tipo-hora?telefono={telefono}"
+        method="POST"
+        timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            No entendí su respuesta.
+            Presione 1 para elegir una hora específica.
+            Presione 2 para agendar sin hora específica.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+@router.post("/agendar-ia-continuar")
+async def agendar_ia_continuar(
+    telefono: str,
+    Digits: str = Form(""),
+    SpeechResult: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    telefono = normalizar_telefono_mexico(telefono.replace("%2B", "+"))
+
+    flujo = db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+
+    if not flujo:
+        return Response(
+            content="""
+<Response>
+    <Say language="es-MX" voice="Polly.Mia-Neural">
+        No encontré una conversación activa. Intente llamar nuevamente.
+    </Say>
+</Response>
+""",
+            media_type="application/xml",
+        )
+
+    empresa = db.query(Empresa).filter(Empresa.id == flujo.empresa_id).first()
+
+    return _continuar_agendado_ia_llamada(
+        db=db,
+        empresa=empresa,
+        telefono=telefono,
+        flujo=flujo,
+        digits=Digits,
+        speech=SpeechResult,
+    )
 
 
 @router.post("/guardar-hora")
@@ -944,7 +1987,7 @@ async def guardar_hora(
             return Response(
                 content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa.
     </Say>
 </Response>
@@ -966,13 +2009,13 @@ async def guardar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             ¿Se refiere a las {SpeechResult} de la mañana o de la tarde?
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí la aclaración. Intente nuevamente.
     </Say>
 </Response>
@@ -981,7 +2024,32 @@ async def guardar_hora(
         return Response(content=twiml, media_type="application/xml")
 
     if hora is None:
-        twiml = f"""
+        conversacion_para_ia = (
+            db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
+        )
+        empresa_para_ia = (
+            db.query(Empresa).filter(Empresa.id == conversacion_para_ia.empresa_id).first()
+            if conversacion_para_ia
+            else None
+        )
+
+        if empresa_para_ia and conversacion_para_ia:
+            contexto = construir_contexto_empresa(db, empresa_para_ia)
+            resultado_ia = interpretar_mensaje(
+                empresa=empresa_para_ia,
+                contexto=contexto,
+                paso_actual="PEDIR_HORA",
+                mensaje_usuario=SpeechResult.strip(),
+            )
+
+            if resultado_ia and resultado_ia.hora:
+                hora_ia = normalizar_hora_valida(resultado_ia.hora)
+
+                if hora_ia:
+                    hora = hora_ia
+
+        if hora is None:
+            twiml = f"""
 <Response>
     <Gather
         input="speech"
@@ -991,24 +2059,24 @@ async def guardar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No entendí la hora.
         </Say>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí ninguna respuesta. Intente nuevamente.
     </Say>
 </Response>
 """
 
-        return Response(content=twiml, media_type="application/xml")
-    
+            return Response(content=twiml, media_type="application/xml")
+
     conversacion = (
         db.query(Conversacion)
         .filter(Conversacion.telefono == telefono)
@@ -1019,7 +2087,7 @@ async def guardar_hora(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa.
     </Say>
 </Response>
@@ -1036,7 +2104,7 @@ async def guardar_hora(
             action="/guardar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Esa hora ya pasó.
                 Por favor indique una hora futura.
             </Say>
@@ -1068,7 +2136,7 @@ async def guardar_hora(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Lo sentimos.
                 El horario de atención es de {empresa.horario_inicio} a {empresa.horario_fin}.
                 Por favor indique otra hora.
@@ -1076,7 +2144,7 @@ async def guardar_hora(
 
         </Gather>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No recibí la hora. Intente nuevamente.
         </Say>
     </Response>
@@ -1156,7 +2224,7 @@ async def guardar_hora(
 
     twiml = f"""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Perfecto {conversacion.nombre}.
         Su cita fue agendada para el día {conversacion.fecha}
         a las {hora} horas.
@@ -1184,7 +2252,7 @@ async def aclarar_hora(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa.
     </Say>
 </Response>
@@ -1200,7 +2268,7 @@ async def aclarar_hora(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No pude identificar la hora.
     </Say>
 </Response>
@@ -1222,7 +2290,7 @@ async def aclarar_hora(
             action="/guardar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Esa hora ya pasó.
                 Por favor indique una hora futura.
             </Say>
@@ -1246,7 +2314,7 @@ async def aclarar_hora(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Lo sentimos.
                 Nuestro horario de atención es de
                 {empresa.horario_inicio}
@@ -1257,7 +2325,7 @@ async def aclarar_hora(
 
         </Gather>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No recibí ninguna respuesta.
         </Say>
 
@@ -1338,7 +2406,7 @@ async def aclarar_hora(
 
     twiml = f"""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Perfecto.
         Su cita fue agendada para el día
         {nueva_cita.fecha}
@@ -1368,7 +2436,7 @@ async def reprogramar_fecha(
             action="/reprogramar-fecha?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 La fecha indicada ya pasó.
                 Por favor indique una fecha futura.
             </Say>
@@ -1390,7 +2458,7 @@ async def reprogramar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
         </Say>
 
@@ -1408,7 +2476,7 @@ async def reprogramar_fecha(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa.
     </Say>
 </Response>
@@ -1431,13 +2499,13 @@ async def reprogramar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto. ¿A qué nueva hora desea reprogramar su cita?
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí la hora. Intente nuevamente.
     </Say>
 </Response>
@@ -1462,7 +2530,7 @@ async def reprogramar_tipo_prestador(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa. Intente llamar nuevamente.
     </Say>
 </Response>
@@ -1487,7 +2555,7 @@ async def reprogramar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?
         </Say>
 
@@ -1512,7 +2580,7 @@ async def reprogramar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto, se atenderá con cualquier profesional disponible.
             ¿Para qué nueva fecha desea reprogramar su cita?
         </Say>
@@ -1545,7 +2613,7 @@ async def reprogramar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Por el momento no hay profesionales específicos disponibles para ese servicio.
             Le atenderá cualquier profesional disponible.
             ¿Para qué nueva fecha desea reprogramar su cita?
@@ -1560,7 +2628,7 @@ async def reprogramar_tipo_prestador(
 
         for i, prestador in enumerate(prestadores, start=1):
             lista_prestadores += f"""
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 {i}. {prestador.nombre}
             </Say>
             """
@@ -1577,13 +2645,13 @@ async def reprogramar_tipo_prestador(
     method="POST"
     timeout="10">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Seleccione uno de los siguientes profesionales.
         </Say>
 
         {lista_prestadores}
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Presione en su teléfono el número del profesional que desea.
         </Say>
 
@@ -1601,7 +2669,7 @@ async def reprogramar_tipo_prestador(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No entendí su respuesta. Presione 1 o presione 2.
         </Say>
 
@@ -1627,7 +2695,7 @@ async def reprogramar_prestador(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa. Intente llamar nuevamente.
     </Say>
 </Response>
@@ -1653,7 +2721,7 @@ async def reprogramar_prestador(
 
         for i, prestador in enumerate(prestadores, start=1):
             lista_prestadores += f"""
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 {i}. {prestador.nombre}
             </Say>
             """
@@ -1692,7 +2760,7 @@ async def reprogramar_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Perfecto, se atenderá con {prestador_seleccionado.nombre}.
             ¿Para qué nueva fecha desea reprogramar su cita?
         </Say>
@@ -1724,7 +2792,7 @@ async def reprogramar_hora(
             return Response(
                 content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa.
     </Say>
 </Response>
@@ -1746,13 +2814,13 @@ async def reprogramar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             ¿Se refiere a las {SpeechResult} de la mañana o de la tarde?
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí la aclaración. Intente nuevamente.
     </Say>
 </Response>
@@ -1771,17 +2839,17 @@ async def reprogramar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No entendí la hora.
         </Say>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
         </Say>
 
     </Gather>
 
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No recibí ninguna respuesta. Intente nuevamente.
     </Say>
 </Response>
@@ -1796,7 +2864,7 @@ async def reprogramar_hora(
         return Response(
             content="""
     <Response>
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No encontré una conversación activa.
         </Say>
     </Response>
@@ -1813,7 +2881,7 @@ async def reprogramar_hora(
             action="/reprogramar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Esa hora ya pasó.
                 Por favor indique una hora futura.
             </Say>
@@ -1835,7 +2903,7 @@ async def reprogramar_hora(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una cita activa para reprogramar.
     </Say>
 </Response>
@@ -1857,7 +2925,7 @@ async def reprogramar_hora(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Lo sentimos.
                 Nuestro horario de atención es de
                 {empresa.horario_inicio}
@@ -1868,7 +2936,7 @@ async def reprogramar_hora(
 
         </Gather>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No recibí ninguna respuesta.
         </Say>
 
@@ -1938,7 +3006,7 @@ async def reprogramar_hora(
 
     twiml = f"""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Su cita fue reprogramada correctamente para el día
         {nueva_cita.fecha}
         a las
@@ -1966,7 +3034,7 @@ async def aclarar_hora_reprogramar(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una conversación activa.
     </Say>
 </Response>
@@ -1982,7 +3050,7 @@ async def aclarar_hora_reprogramar(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No pude identificar la hora.
     </Say>
 </Response>
@@ -2004,7 +3072,7 @@ async def aclarar_hora_reprogramar(
             action="/reprogramar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Esa hora ya pasó.
                 Por favor indique una hora futura.
             </Say>
@@ -2026,7 +3094,7 @@ async def aclarar_hora_reprogramar(
         return Response(
             content="""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         No encontré una cita activa para reprogramar.
     </Say>
 </Response>
@@ -2048,7 +3116,7 @@ async def aclarar_hora_reprogramar(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX">
+            <Say language="es-MX" voice="Polly.Mia-Neural">
                 Lo sentimos.
                 Nuestro horario de atención es de
                 {empresa.horario_inicio}
@@ -2059,7 +3127,7 @@ async def aclarar_hora_reprogramar(
 
         </Gather>
 
-        <Say language="es-MX">
+        <Say language="es-MX" voice="Polly.Mia-Neural">
             No recibí ninguna respuesta.
         </Say>
 
@@ -2126,7 +3194,7 @@ async def aclarar_hora_reprogramar(
     db.commit()
     twiml = f"""
 <Response>
-    <Say language="es-MX">
+    <Say language="es-MX" voice="Polly.Mia-Neural">
         Su cita fue reprogramada correctamente para el día
         {nueva_cita.fecha}
         a las

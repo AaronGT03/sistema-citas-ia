@@ -28,3 +28,11 @@ class Conversacion(Base):
         default=False,
         nullable=False,
     )
+
+    sin_hora_especifica = Column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+
+    franja_preferida = Column(String, nullable=True)

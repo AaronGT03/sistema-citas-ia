@@ -45,6 +45,9 @@ def crear_empresa(
     horario_inicio: str = "09:00",
     horario_fin: str = "18:00",
     usa_prestadores: bool = False,
+    permite_citas_sin_hora: bool = False,
+    giro: str | None = None,
+    prompt_base: str | None = None,
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
 ):
@@ -65,6 +68,9 @@ def crear_empresa(
         horario_inicio=horario_inicio,
         horario_fin=horario_fin,
         usa_prestadores=usa_prestadores,
+        permite_citas_sin_hora=permite_citas_sin_hora,
+        giro=giro,
+        prompt_base=prompt_base,
     )
 
     db.add(empresa)
@@ -137,12 +143,20 @@ def obtener_resumen_empresa(
         .count()
     )
 
+    citas_pendientes_hora = (
+        db.query(Cita)
+        .filter(Cita.empresa_id == empresa_id)
+        .filter(Cita.status == "PENDIENTE_HORA")
+        .count()
+    )
+
     return {
         "empresa": empresa.nombre,
         "empresa_id": empresa.id,
         "total_citas": total_citas,
         "citas_activas": citas_activas,
         "citas_canceladas": citas_canceladas,
+        "citas_pendientes_hora": citas_pendientes_hora,
     }
 
 
@@ -154,7 +168,10 @@ def editar_empresa(
     horario_inicio: str = "09:00",
     horario_fin: str = "18:00",
     activa: bool = True,
-    usa_prestadores: bool = False,
+    usa_prestadores: bool | None = None,
+    permite_citas_sin_hora: bool | None = None,
+    giro: str | None = None,
+    prompt_base: str | None = None,
     db: Session = Depends(get_db),
     usuario_actual: dict = Depends(obtener_usuario_actual),
 ):
@@ -182,7 +199,22 @@ def editar_empresa(
     empresa.horario_inicio = horario_inicio
     empresa.horario_fin = horario_fin
     empresa.activa = activa
-    empresa.usa_prestadores = usa_prestadores
+
+    # usa_prestadores/permite_citas_sin_hora/giro/prompt_base son opcionales:
+    # si no se envían (ej. desde el formulario actual del dashboard, que no
+    # los conoce), se conserva el valor que ya tenía la empresa en vez de
+    # resetearlo a su default.
+    if usa_prestadores is not None:
+        empresa.usa_prestadores = usa_prestadores
+
+    if permite_citas_sin_hora is not None:
+        empresa.permite_citas_sin_hora = permite_citas_sin_hora
+
+    if giro is not None:
+        empresa.giro = giro
+
+    if prompt_base is not None:
+        empresa.prompt_base = prompt_base
 
     db.commit()
     db.refresh(empresa)
