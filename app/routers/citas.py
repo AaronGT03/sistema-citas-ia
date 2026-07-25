@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -9,6 +11,7 @@ from app.services.citas_service import (
     seleccionar_prestador_automaticamente,
     crear_solicitud_sin_hora,
     reprogramar_cita as reprogramar_cita_service,
+    calcular_estadisticas_mes,
 )
 
 router = APIRouter()
@@ -186,7 +189,7 @@ def listar_citas(
     if prestador_id is not None:
         query = query.filter(Cita.prestador_id == prestador_id)
 
-    resultados = query.all()
+    resultados = query.order_by(Cita.id.desc()).all()
 
     citas = []
 
@@ -211,6 +214,34 @@ def listar_citas(
         )
 
     return citas
+
+
+@router.get("/citas/estadisticas")
+def obtener_estadisticas(
+    mes: str | None = None,
+    db: Session = Depends(get_db),
+    usuario_actual: dict = Depends(obtener_usuario_actual),
+):
+    empresa_id = usuario_actual["empresa_id"]
+
+    if empresa_id is None:
+        raise HTTPException(
+            status_code=403,
+            detail="El usuario ADMIN no tiene una empresa asociada para ver estadísticas.",
+        )
+
+    referencia = None
+
+    if mes:
+        try:
+            referencia = datetime.strptime(mes, "%Y-%m")
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="El parámetro 'mes' debe tener el formato AAAA-MM",
+            )
+
+    return calcular_estadisticas_mes(db, empresa_id, referencia=referencia)
 
 
 @router.get("/citas/activa/{telefono}")

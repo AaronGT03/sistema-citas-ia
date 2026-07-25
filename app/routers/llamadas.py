@@ -289,10 +289,66 @@ def _validar_y_guardar_hora_ia(db: Session, empresa: Empresa, flujo: Conversacio
     return None
 
 
-def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str, flujo: Conversacion, servicio: Servicio):
+def _preguntar_servicio_ia_llamada(db: Session, empresa: Empresa, telefono: str, flujo: Conversacion):
+    """Pregunta por el servicio cuando la IA reconoció otros datos del
+    mensaje inicial (ej. el prestador) pero no pudo resolver el servicio
+    contra el catálogo real. Mantiene la conversación dentro del flujo
+    AGENDAR_IA para no perder lo que ya se sabe."""
+
+    flujo.mensaje = "ESPERANDO_SERVICIO"
+    db.commit()
+
+    servicios = (
+        db.query(Servicio)
+        .filter(Servicio.empresa_id == empresa.id, Servicio.activo == True)
+        .order_by(Servicio.id)
+        .all()
+    )
+
+    lista_servicios = ""
+
+    for i, servicio in enumerate(servicios, start=1):
+        lista_servicios += f"""
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            {i}. {servicio.nombre}
+        </Say>
+        """
+
+    twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/agendar-ia-continuar?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            ¿Qué servicio desea agendar?
+        </Say>
+
+        {lista_servicios}
+
+        <Say language="es-MX" voice="Polly.Mia-Neural">
+            Presione en su teléfono el número del servicio que desea.
+        </Say>
+
+    </Gather>
+</Response>
+"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str, flujo: Conversacion, servicio: Servicio | None):
     """Con el estado actual de flujo (nombre/fecha/hora/prestador ya
     conocidos o no), decide qué preguntar a continuación en el mismo
     orden que el flujo determinístico, o crea la cita si ya se sabe todo."""
+
+    if not flujo.servicio_id:
+        return _preguntar_servicio_ia_llamada(db, empresa, telefono, flujo)
+
+    if servicio is None:
+        servicio = db.query(Servicio).filter(Servicio.id == flujo.servicio_id).first()
 
     if empresa.usa_prestadores and not flujo.prestador_id and not flujo.asignacion_automatica:
         flujo.mensaje = "ESPERANDO_TIPO_PRESTADOR"
@@ -559,7 +615,67 @@ def _continuar_agendado_ia_llamada(
     servicio = db.query(Servicio).filter(Servicio.id == flujo.servicio_id).first()
     marcador = flujo.mensaje
 
-    if marcador == "ESPERANDO_TIPO_PRESTADOR":
+    if marcador == "ESPERANDO_SERVICIO":
+        servicios = (
+            db.query(Servicio)
+            .filter(Servicio.empresa_id == empresa.id, Servicio.activo == True)
+            .order_by(Servicio.id)
+            .all()
+        )
+
+        opcion = digits.strip()
+        servicio_elegido = None
+
+        if opcion.isdigit():
+            indice = int(opcion) - 1
+
+            if 0 <= indice < len(servicios):
+                servicio_elegido = servicios[indice]
+
+        if not servicio_elegido:
+            lista_servicios = ""
+
+            for i, s in enumerate(servicios, start=1):
+                lista_servicios += f"""
+            <Say language="es-MX" voice="Polly.Mia-Neural">
+                {i}. {s.nombre}
+            </Say>
+            """
+
+            twiml = f"""
+<Response>
+    <Gather
+    input="dtmf"
+    numDigits="1"
+    action="/agendar-ia-continuar?telefono={telefono}"
+    method="POST"
+    timeout="10">
+
+        No entendí el servicio. Por favor presione un número válido.
+
+        {lista_servicios}
+
+    </Gather>
+</Response>
+"""
+            return Response(content=twiml, media_type="application/xml")
+
+        flujo.servicio_id = servicio_elegido.id
+
+        if flujo.prestador_id and empresa.usa_prestadores:
+            compatibles_ids = {
+                p.id for p in obtener_prestadores_compatibles(db, empresa.id, servicio_elegido.id)
+            }
+
+            if flujo.prestador_id not in compatibles_ids:
+                flujo.prestador_id = None
+
+        flujo.mensaje = None
+        db.commit()
+
+        servicio = servicio_elegido
+
+    elif marcador == "ESPERANDO_TIPO_PRESTADOR":
         opcion = digits.strip()
 
         if opcion == "2":
@@ -1010,12 +1126,6 @@ def iniciar_agendado_desde_ia_llamada(
 
     servicio = resolver_por_nombre(resultado_ia.servicio, servicios_activos)
 
-    if not servicio:
-        return None
-
-    db.query(Conversacion).filter(Conversacion.telefono == telefono).delete()
-    db.commit()
-
     nombre = resultado_ia.nombre.strip() if resultado_ia.nombre else None
 
     fecha = None
@@ -1039,11 +1149,31 @@ def iniciar_agendado_desde_ia_llamada(
         if resultado_ia.cualquier_prestador:
             asignacion_automatica = True
         elif resultado_ia.prestador:
-            prestadores_compatibles = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
-            prestador = resolver_por_nombre(resultado_ia.prestador, prestadores_compatibles)
+            # Si ya sabemos el servicio, solo cuentan los prestadores que lo
+            # realizan; si aún no se resolvió el servicio, se busca contra
+            # todos los prestadores activos de la empresa (se revalida la
+            # compatibilidad en cuanto se conozca el servicio).
+            candidatos = (
+                obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+                if servicio
+                else db.query(Prestador)
+                .filter(Prestador.empresa_id == empresa.id, Prestador.activo == True)
+                .all()
+            )
+            prestador = resolver_por_nombre(resultado_ia.prestador, candidatos)
 
             if prestador:
                 prestador_id = prestador.id
+
+    datos_utiles = bool(
+        servicio or nombre or fecha or hora or prestador_id or asignacion_automatica
+    )
+
+    if not datos_utiles:
+        return None
+
+    db.query(Conversacion).filter(Conversacion.telefono == telefono).delete()
+    db.commit()
 
     flujo = Conversacion(
         telefono=telefono,
@@ -1053,7 +1183,7 @@ def iniciar_agendado_desde_ia_llamada(
         nombre=nombre,
         fecha=fecha,
         hora=hora,
-        servicio_id=servicio.id,
+        servicio_id=servicio.id if servicio else None,
         prestador_id=prestador_id,
         asignacion_automatica=asignacion_automatica,
         sin_hora_especifica=sin_hora,

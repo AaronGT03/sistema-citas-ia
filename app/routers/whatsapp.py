@@ -255,7 +255,52 @@ def _continuar_agendado_ia(
     marcador = flujo.mensaje
     vocab = vocabulario_por_giro(empresa.giro)
 
-    if marcador == "ESPERANDO_TIPO_PRESTADOR":
+    if marcador == "ESPERANDO_SERVICIO":
+        servicios = (
+            db.query(Servicio)
+            .filter(Servicio.empresa_id == empresa.id, Servicio.activo == True)
+            .order_by(Servicio.id)
+            .all()
+        )
+
+        servicio_elegido = None
+
+        if respuesta_usuario and respuesta_usuario.startswith("SERVICIO_"):
+            try:
+                servicio_id_elegido = int(respuesta_usuario.replace("SERVICIO_", ""))
+            except ValueError:
+                servicio_id_elegido = None
+
+            servicio_elegido = next((s for s in servicios if s.id == servicio_id_elegido), None)
+
+        if not servicio_elegido:
+            filas = [{"id": f"SERVICIO_{s.id}", "title": s.nombre} for s in servicios]
+            enviar_lista_whatsapp(
+                phone_number_id=numero.phone_number_id,
+                token=numero.token,
+                telefono_cliente=telefono_cliente,
+                texto="No reconocí esa opción. Por favor selecciona un servicio de la lista:",
+                boton_texto="Ver servicios",
+                filas=filas,
+            )
+            return
+
+        flujo.servicio_id = servicio_elegido.id
+
+        if flujo.prestador_id and empresa.usa_prestadores:
+            compatibles_ids = {
+                p.id for p in obtener_prestadores_compatibles(db, empresa.id, servicio_elegido.id)
+            }
+
+            if flujo.prestador_id not in compatibles_ids:
+                flujo.prestador_id = None
+
+        flujo.mensaje = None
+        db.commit()
+
+        servicio = servicio_elegido
+
+    elif marcador == "ESPERANDO_TIPO_PRESTADOR":
         if respuesta_usuario == "CUALQUIER_PRESTADOR":
             flujo.asignacion_automatica = True
             flujo.mensaje = None
@@ -419,6 +464,28 @@ def _continuar_agendado_ia(
         db.commit()
 
     # ---- Con el estado ya actualizado, decide qué falta a continuación ----
+
+    if not flujo.servicio_id:
+        flujo.mensaje = "ESPERANDO_SERVICIO"
+        db.commit()
+
+        servicios_activos = (
+            db.query(Servicio)
+            .filter(Servicio.empresa_id == empresa.id, Servicio.activo == True)
+            .order_by(Servicio.id)
+            .all()
+        )
+
+        filas = [{"id": f"SERVICIO_{s.id}", "title": s.nombre} for s in servicios_activos]
+        enviar_lista_whatsapp(
+            phone_number_id=numero.phone_number_id,
+            token=numero.token,
+            telefono_cliente=telefono_cliente,
+            texto="¿Qué servicio te gustaría agendar?",
+            boton_texto="Ver servicios",
+            filas=filas,
+        )
+        return
 
     if empresa.usa_prestadores and not flujo.prestador_id and not flujo.asignacion_automatica:
         flujo.mensaje = "ESPERANDO_TIPO_PRESTADOR"
@@ -647,11 +714,6 @@ def iniciar_agendado_desde_ia(
 
     servicio = _resolver_por_nombre(resultado_ia.servicio, servicios_activos)
 
-    if not servicio:
-        return False
-
-    limpiar_flujos_activos(db, empresa.id, telefono_cliente)
-
     nombre = resultado_ia.nombre.strip() if resultado_ia.nombre else None
 
     fecha = None
@@ -675,11 +737,30 @@ def iniciar_agendado_desde_ia(
         if resultado_ia.cualquier_prestador:
             asignacion_automatica = True
         elif resultado_ia.prestador:
-            prestadores_compatibles = obtener_prestadores_compatibles(db, empresa.id, servicio.id)
-            prestador = _resolver_por_nombre(resultado_ia.prestador, prestadores_compatibles)
+            # Si ya sabemos el servicio, solo cuentan los prestadores que lo
+            # realizan; si aún no se resolvió el servicio, se busca contra
+            # todos los prestadores activos de la empresa (se revalida la
+            # compatibilidad en cuanto se conozca el servicio).
+            candidatos = (
+                obtener_prestadores_compatibles(db, empresa.id, servicio.id)
+                if servicio
+                else db.query(Prestador)
+                .filter(Prestador.empresa_id == empresa.id, Prestador.activo == True)
+                .all()
+            )
+            prestador = _resolver_por_nombre(resultado_ia.prestador, candidatos)
 
             if prestador:
                 prestador_id = prestador.id
+
+    datos_utiles = bool(
+        servicio or nombre or fecha or hora or prestador_id or asignacion_automatica
+    )
+
+    if not datos_utiles:
+        return False
+
+    limpiar_flujos_activos(db, empresa.id, telefono_cliente)
 
     flujo = guardar_conversacion(
         db=db,
@@ -691,7 +772,7 @@ def iniciar_agendado_desde_ia(
         nombre=nombre,
         fecha=fecha,
         hora=hora,
-        servicio_id=servicio.id,
+        servicio_id=servicio.id if servicio else None,
         prestador_id=prestador_id,
         asignacion_automatica=asignacion_automatica,
     )

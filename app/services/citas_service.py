@@ -397,7 +397,7 @@ def construir_contexto_empresa(db, empresa: Empresa):
                 "id": prestador.id,
                 "nombre": prestador.nombre,
                 "descripcion": prestador.descripcion,
-                "servicios": [s.nombre for s in prestador.servicios],
+                "servicios": [s.nombre for s in prestador.servicios if s.activo],
             }
             for prestador in prestadores
         ],
@@ -477,3 +477,89 @@ def resolver_por_nombre(nombre_buscado: str | None, candidatos: list, atributo: 
             return candidato
 
     return None
+
+
+# =====================================================================
+# Estadísticas del mes en curso. Se recalculan siempre a partir de las
+# citas reales filtradas por el mes calendario actual (fecha de la cita,
+# no fecha de creación) — no se guarda ningún contador aparte, así que
+# no hace falta "reiniciar" nada el día 1: el filtro de fechas ya excluye
+# automáticamente todo lo que no sea del mes en curso.
+# =====================================================================
+
+def calcular_estadisticas_mes(db, empresa_id: int, referencia: datetime | None = None):
+    ahora = referencia or datetime.now()
+    inicio_mes = ahora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    if inicio_mes.month == 12:
+        fin_mes = inicio_mes.replace(year=inicio_mes.year + 1, month=1)
+    else:
+        fin_mes = inicio_mes.replace(month=inicio_mes.month + 1)
+
+    def es_del_mes(fecha_texto: str | None) -> bool:
+        if not fecha_texto:
+            return False
+
+        try:
+            fecha = datetime.strptime(fecha_texto, "%d/%m/%Y")
+        except ValueError:
+            return False
+
+        return inicio_mes <= fecha < fin_mes
+
+    resultados = (
+        db.query(Cita, Servicio)
+        .outerjoin(Servicio, Cita.servicio_id == Servicio.id)
+        .filter(Cita.empresa_id == empresa_id)
+        .all()
+    )
+
+    ganancias_mes = 0
+    citas_concluidas_mes = 0
+    servicios_contador: dict[str, int] = {}
+    canal_contador: dict[str, int] = {}
+    hora_contador: dict[str, int] = {}
+
+    for cita, servicio in resultados:
+        if cita.status != "AGENDADA" or not es_del_mes(cita.fecha):
+            continue
+
+        canal_contador[cita.canal] = canal_contador.get(cita.canal, 0) + 1
+
+        if servicio:
+            servicios_contador[servicio.nombre] = servicios_contador.get(servicio.nombre, 0) + 1
+
+        if cita.sin_hora_especifica or not cita.hora:
+            continue
+
+        hora_contador[cita.hora] = hora_contador.get(cita.hora, 0) + 1
+
+        if hora_ya_paso(cita.fecha, cita.hora):
+            citas_concluidas_mes += 1
+
+            if servicio and servicio.precio:
+                ganancias_mes += servicio.precio
+
+    servicios_populares = sorted(
+        (
+            {"servicio": nombre, "citas": cantidad}
+            for nombre, cantidad in servicios_contador.items()
+        ),
+        key=lambda item: item["citas"],
+        reverse=True,
+    )
+
+    horas_populares = sorted(
+        ({"hora": hora, "citas": cantidad} for hora, cantidad in hora_contador.items()),
+        key=lambda item: item["citas"],
+        reverse=True,
+    )
+
+    return {
+        "mes": inicio_mes.strftime("%Y-%m"),
+        "ganancias_mes": ganancias_mes,
+        "citas_concluidas_mes": citas_concluidas_mes,
+        "servicios_populares": servicios_populares,
+        "horas_populares": horas_populares,
+        "citas_por_canal": canal_contador,
+    }
