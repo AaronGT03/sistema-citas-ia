@@ -1,5 +1,8 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.database import engine, Base
 from app.routers.citas import router as citas_router
@@ -34,6 +37,10 @@ app.include_router(citas_router)
 app.include_router(llamadas_router)
 app.include_router(whatsapp_router)
 app.include_router(prestadores_router)
+
+# Audios temporales generados por ElevenLabs (ver app/services/elevenlabs_service.py).
+os.makedirs("app/static/audio", exist_ok=True)
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 @app.get("/")

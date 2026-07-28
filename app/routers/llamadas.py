@@ -1,5 +1,3 @@
-from xml.sax.saxutils import escape
-
 from fastapi import APIRouter, Depends, Form
 from sqlalchemy.orm import Session
 from fastapi.responses import Response
@@ -29,64 +27,61 @@ from app.services.citas_service import (
     resolver_por_nombre,
 )
 from app.services.openai_service import interpretar_mensaje, responder_pregunta_empresa
+from app.services.voz_service import construir_bloque_voz, construir_bloques_voz
 
 router = APIRouter()
 
 
 
 def respuesta_horario_ocupado():
-    twiml = """
+    voz_1 = construir_bloque_voz(
+        "Ya existe una cita programada para esa fecha y hora. Por favor seleccione otro horario."
+    )
+    twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Ya existe una cita programada para esa fecha y hora.
-        Por favor seleccione otro horario.
-    </Say>
+    {voz_1}
 </Response>
 """
     return Response(content=twiml, media_type="application/xml")
 
 
 def respuesta_prestador_ocupado(alternativas=None):
-    mensaje_alternativas = ""
+    voz_alternativas = ""
 
     if alternativas:
         horas_texto = ", ".join(alternativas[:3])
-        mensaje_alternativas = f"""
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Los horarios disponibles más cercanos son: {horas_texto}.
-        Por favor vuelva a llamar para agendar en uno de esos horarios.
-    </Say>
-"""
+        voz_alternativas = construir_bloque_voz(
+            f"Los horarios disponibles más cercanos son: {horas_texto}. "
+            "Por favor vuelva a llamar para agendar en uno de esos horarios."
+        )
+
+    voz_1 = construir_bloque_voz("Ese profesional no está disponible en ese horario.")
 
     twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Ese profesional no está disponible en ese horario.
-    </Say>
-{mensaje_alternativas}
+    {voz_1}
+{voz_alternativas}
 </Response>
 """
     return Response(content=twiml, media_type="application/xml")
 
 
 def respuesta_sin_prestadores(alternativas=None):
-    mensaje_alternativas = ""
+    voz_alternativas = ""
 
     if alternativas:
         horas_texto = ", ".join(alternativas[:3])
-        mensaje_alternativas = f"""
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Los horarios disponibles más cercanos son: {horas_texto}.
-        Por favor vuelva a llamar para agendar en uno de esos horarios.
-    </Say>
-"""
+        voz_alternativas = construir_bloque_voz(
+            f"Los horarios disponibles más cercanos son: {horas_texto}. "
+            "Por favor vuelva a llamar para agendar en uno de esos horarios."
+        )
+
+    voz_1 = construir_bloque_voz("No hay profesionales disponibles en ese horario.")
 
     twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No hay profesionales disponibles en ese horario.
-    </Say>
-{mensaje_alternativas}
+    {voz_1}
+{voz_alternativas}
 </Response>
 """
     return Response(content=twiml, media_type="application/xml")
@@ -146,6 +141,10 @@ def responder_consulta_en_flujo(
     else:
         texto = f"Solo puedo ayudarte con información, servicios y citas de {empresa.nombre}."
 
+    voz_1, voz_2 = construir_bloques_voz(
+        texto, f"Continuemos con su cita. {pregunta_pendiente}", empresa_id=empresa.id
+    )
+
     twiml = f"""
 <Response>
     <Gather
@@ -156,13 +155,9 @@ def responder_consulta_en_flujo(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            {escape(texto)}
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Continuemos con su cita. {escape(pregunta_pendiente)}
-        </Say>
+        {voz_2}
 
     </Gather>
 </Response>
@@ -200,6 +195,8 @@ def respuesta_disponibilidad_en_flujo(
             "Puede volver a llamar para intentar con otra fecha."
         )
 
+    voz_1, voz_2 = construir_bloques_voz(texto, pregunta_pendiente, empresa_id=empresa.id)
+
     twiml = f"""
 <Response>
     <Gather
@@ -210,13 +207,9 @@ def respuesta_disponibilidad_en_flujo(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            {escape(texto)}
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            {escape(pregunta_pendiente)}
-        </Say>
+        {voz_2}
 
     </Gather>
 </Response>
@@ -242,6 +235,9 @@ def _validar_y_guardar_hora_ia(db: Session, empresa: Empresa, flujo: Conversacio
     reintento correspondiente."""
 
     if hora_ya_paso(flujo.fecha, hora):
+        voz_1 = construir_bloque_voz(
+            "Esa hora ya pasó. Por favor indique una hora futura.", empresa_id=empresa.id
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -250,10 +246,7 @@ def _validar_y_guardar_hora_ia(db: Session, empresa: Empresa, flujo: Conversacio
         action="/agendar-ia-continuar?telefono={telefono}"
         method="POST">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Esa hora ya pasó.
-            Por favor indique una hora futura.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -261,6 +254,11 @@ def _validar_y_guardar_hora_ia(db: Session, empresa: Empresa, flujo: Conversacio
         return Response(content=twiml, media_type="application/xml")
 
     if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+        voz_1 = construir_bloque_voz(
+            f"Lo sentimos. El horario de atención es de {empresa.horario_inicio} a "
+            f"{empresa.horario_fin}. Por favor indique otra hora.",
+            empresa_id=empresa.id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -271,11 +269,7 @@ def _validar_y_guardar_hora_ia(db: Session, empresa: Empresa, flujo: Conversacio
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Lo sentimos.
-            El horario de atención es de {empresa.horario_inicio} a {empresa.horario_fin}.
-            Por favor indique otra hora.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -305,14 +299,16 @@ def _preguntar_servicio_ia_llamada(db: Session, empresa: Empresa, telefono: str,
         .all()
     )
 
-    lista_servicios = ""
+    textos_servicios = [f"{i}. {servicio.nombre}" for i, servicio in enumerate(servicios, start=1)]
 
-    for i, servicio in enumerate(servicios, start=1):
-        lista_servicios += f"""
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            {i}. {servicio.nombre}
-        </Say>
-        """
+    voz_pregunta, voz_instruccion, *bloques_servicios = construir_bloques_voz(
+        "¿Qué servicio desea agendar?",
+        "Presione en su teléfono el número del servicio que desea.",
+        *textos_servicios,
+        empresa_id=empresa.id,
+    )
+
+    lista_servicios = "\n        ".join(bloques_servicios)
 
     twiml = f"""
 <Response>
@@ -323,15 +319,11 @@ def _preguntar_servicio_ia_llamada(db: Session, empresa: Empresa, telefono: str,
     method="POST"
     timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Qué servicio desea agendar?
-        </Say>
+        {voz_pregunta}
 
         {lista_servicios}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Presione en su teléfono el número del servicio que desea.
-        </Say>
+        {voz_instruccion}
 
     </Gather>
 </Response>
@@ -354,6 +346,12 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         flujo.mensaje = "ESPERANDO_TIPO_PRESTADOR"
         db.commit()
 
+        voz_1 = construir_bloque_voz(
+            f"Para su {servicio.nombre}, ¿desea atenderse con un profesional específico o con "
+            "cualquiera disponible? Presione 1 para elegir un profesional. Presione 2 para "
+            "atenderse con cualquier profesional disponible.",
+            empresa_id=empresa.id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -363,12 +361,7 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Para su {servicio.nombre},
-            ¿desea atenderse con un profesional específico o con cualquiera disponible?
-            Presione 1 para elegir un profesional.
-            Presione 2 para atenderse con cualquier profesional disponible.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -379,6 +372,7 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         flujo.mensaje = "ESPERANDO_NOMBRE"
         db.commit()
 
+        voz_1 = construir_bloque_voz("¿Cuál es su nombre completo?", empresa_id=empresa.id)
         twiml = f"""
 <Response>
     <Gather
@@ -389,9 +383,7 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Cuál es su nombre completo?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -402,6 +394,9 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         flujo.mensaje = "ESPERANDO_FECHA"
         db.commit()
 
+        voz_1 = construir_bloque_voz(
+            f"Gracias {flujo.nombre}. ¿Qué fecha desea para su cita?", empresa_id=empresa.id
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -412,9 +407,7 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Gracias {flujo.nombre}. ¿Qué fecha desea para su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -426,6 +419,12 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
             flujo.mensaje = "ESPERANDO_TIPO_HORA"
             db.commit()
 
+            voz_1 = construir_bloque_voz(
+                "Puede elegir una hora específica o indicar que no tiene preferencia de horario. "
+                "Presione 1 para elegir una hora específica. Presione 2 para agendar sin hora "
+                "específica.",
+                empresa_id=empresa.id,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -435,11 +434,7 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Puede elegir una hora específica o indicar que no tiene preferencia de horario.
-            Presione 1 para elegir una hora específica.
-            Presione 2 para agendar sin hora específica.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -448,6 +443,7 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
             flujo.mensaje = "ESPERANDO_HORA"
             db.commit()
 
+            voz_1 = construir_bloque_voz("Perfecto. ¿A qué hora desea la cita?", empresa_id=empresa.id)
             twiml = f"""
 <Response>
     <Gather
@@ -458,9 +454,7 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto. ¿A qué hora desea la cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -485,11 +479,12 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
             db.delete(flujo)
             db.commit()
 
+            voz_1 = construir_bloque_voz(
+                f"No fue posible registrar su solicitud: {error}.", empresa_id=empresa.id
+            )
             twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No fue posible registrar su solicitud: {error}.
-    </Say>
+    {voz_1}
 </Response>
 """
             return Response(content=twiml, media_type="application/xml")
@@ -499,13 +494,15 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
         db.delete(flujo)
         db.commit()
 
+        voz_1 = construir_bloque_voz(
+            f"Perfecto. Registraré su solicitud para el día {fecha_confirmada} sin una hora "
+            "específica. La empresa podrá asignar el horario posteriormente. Gracias por usar "
+            "nuestro sistema de citas.",
+            empresa_id=empresa.id,
+        )
         twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Perfecto. Registraré su solicitud para el día {fecha_confirmada} sin una hora específica.
-        La empresa podrá asignar el horario posteriormente.
-        Gracias por usar nuestro sistema de citas.
-    </Say>
+    {voz_1}
 </Response>
 """
         return Response(content=twiml, media_type="application/xml")
@@ -591,14 +588,14 @@ def _preguntar_siguiente_o_crear_ia(db: Session, empresa: Empresa, telefono: str
     db.delete(flujo)
     db.commit()
 
+    voz_1 = construir_bloque_voz(
+        f"Perfecto {cita.nombre}. Su cita fue agendada para el día {cita.fecha} a las "
+        f"{cita.hora} horas. Gracias por usar nuestro sistema de citas.",
+        empresa_id=empresa.id,
+    )
     twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Perfecto {cita.nombre}.
-        Su cita fue agendada para el día {cita.fecha}
-        a las {cita.hora} horas.
-        Gracias por usar nuestro sistema de citas.
-    </Say>
+    {voz_1}
 </Response>
 """
     return Response(content=twiml, media_type="application/xml")
@@ -633,14 +630,15 @@ def _continuar_agendado_ia_llamada(
                 servicio_elegido = servicios[indice]
 
         if not servicio_elegido:
-            lista_servicios = ""
+            textos_servicios = [f"{i}. {s.nombre}" for i, s in enumerate(servicios, start=1)]
 
-            for i, s in enumerate(servicios, start=1):
-                lista_servicios += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {s.nombre}
-            </Say>
-            """
+            voz_error, *bloques_servicios = construir_bloques_voz(
+                "No entendí el servicio. Por favor presione un número válido.",
+                *textos_servicios,
+                empresa_id=empresa.id,
+            )
+
+            lista_servicios = "\n            ".join(bloques_servicios)
 
             twiml = f"""
 <Response>
@@ -651,7 +649,7 @@ def _continuar_agendado_ia_llamada(
     method="POST"
     timeout="10">
 
-        No entendí el servicio. Por favor presione un número válido.
+        {voz_error}
 
         {lista_servicios}
 
@@ -690,14 +688,16 @@ def _continuar_agendado_ia_llamada(
                 flujo.mensaje = None
                 db.commit()
             else:
-                lista_prestadores = ""
+                textos_prestadores = [f"{i}. {p.nombre}" for i, p in enumerate(prestadores, start=1)]
 
-                for i, prestador in enumerate(prestadores, start=1):
-                    lista_prestadores += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {prestador.nombre}
-            </Say>
-            """
+                voz_intro, voz_instruccion, *bloques_prestadores = construir_bloques_voz(
+                    "Seleccione uno de los siguientes profesionales.",
+                    "Presione en su teléfono el número del profesional que desea.",
+                    *textos_prestadores,
+                    empresa_id=empresa.id,
+                )
+
+                lista_prestadores = "\n            ".join(bloques_prestadores)
 
                 flujo.mensaje = "ESPERANDO_PRESTADOR_ESPECIFICO"
                 db.commit()
@@ -711,21 +711,22 @@ def _continuar_agendado_ia_llamada(
     method="POST"
     timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Seleccione uno de los siguientes profesionales.
-        </Say>
+        {voz_intro}
 
         {lista_prestadores}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Presione en su teléfono el número del profesional que desea.
-        </Say>
+        {voz_instruccion}
 
     </Gather>
 </Response>
 """
                 return Response(content=twiml, media_type="application/xml")
         else:
+            voz_1 = construir_bloque_voz(
+                "No entendí su respuesta. Presione 1 para elegir un profesional. Presione 2 "
+                "para atenderse con cualquier profesional disponible.",
+                empresa_id=empresa.id,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -735,11 +736,7 @@ def _continuar_agendado_ia_llamada(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí su respuesta.
-            Presione 1 para elegir un profesional.
-            Presione 2 para atenderse con cualquier profesional disponible.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -758,14 +755,15 @@ def _continuar_agendado_ia_llamada(
                 prestador_seleccionado = prestadores[indice]
 
         if not prestador_seleccionado:
-            lista_prestadores = ""
+            textos_prestadores = [f"{i}. {p.nombre}" for i, p in enumerate(prestadores, start=1)]
 
-            for i, prestador in enumerate(prestadores, start=1):
-                lista_prestadores += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {prestador.nombre}
-            </Say>
-            """
+            voz_error, *bloques_prestadores = construir_bloques_voz(
+                "No encontré ese profesional. Por favor presione un número válido.",
+                *textos_prestadores,
+                empresa_id=empresa.id,
+            )
+
+            lista_prestadores = "\n            ".join(bloques_prestadores)
 
             twiml = f"""
 <Response>
@@ -776,7 +774,7 @@ def _continuar_agendado_ia_llamada(
     method="POST"
     timeout="10">
 
-        No encontré ese profesional. Por favor presione un número válido.
+        {voz_error}
 
         {lista_prestadores}
 
@@ -794,6 +792,7 @@ def _continuar_agendado_ia_llamada(
         nombre_limpio = speech.strip()
 
         if not nombre_limpio:
+            voz_1 = construir_bloque_voz("¿Cuál es su nombre completo?", empresa_id=empresa.id)
             twiml = f"""
 <Response>
     <Gather
@@ -804,9 +803,7 @@ def _continuar_agendado_ia_llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Cuál es su nombre completo?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -866,6 +863,11 @@ def _continuar_agendado_ia_llamada(
             if respuesta_consulta is not None:
                 return respuesta_consulta
 
+            voz_1 = construir_bloque_voz(
+                "No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o "
+                "pasado mañana.",
+                empresa_id=empresa.id,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -876,9 +878,7 @@ def _continuar_agendado_ia_llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -886,6 +886,9 @@ def _continuar_agendado_ia_llamada(
             return Response(content=twiml, media_type="application/xml")
 
         if fecha_ya_paso(fecha):
+            voz_1 = construir_bloque_voz(
+                "La fecha indicada ya pasó. Por favor indique una fecha futura.", empresa_id=empresa.id
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -894,10 +897,7 @@ def _continuar_agendado_ia_llamada(
         action="/agendar-ia-continuar?telefono={telefono}"
         method="POST">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            La fecha indicada ya pasó.
-            Por favor indique una fecha futura.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -919,6 +919,7 @@ def _continuar_agendado_ia_llamada(
             flujo.mensaje = "ESPERANDO_HORA"
             db.commit()
 
+            voz_1 = construir_bloque_voz("¿A qué hora desea la cita?", empresa_id=empresa.id)
             twiml = f"""
 <Response>
     <Gather
@@ -929,15 +930,18 @@ def _continuar_agendado_ia_llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿A qué hora desea la cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
 """
             return Response(content=twiml, media_type="application/xml")
         else:
+            voz_1 = construir_bloque_voz(
+                "No entendí su respuesta. Presione 1 para elegir una hora específica. Presione "
+                "2 para agendar sin hora específica.",
+                empresa_id=empresa.id,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -947,11 +951,7 @@ def _continuar_agendado_ia_llamada(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí su respuesta.
-            Presione 1 para elegir una hora específica.
-            Presione 2 para agendar sin hora específica.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -981,6 +981,9 @@ def _continuar_agendado_ia_llamada(
             flujo.hora = None
             db.commit()
 
+            voz_1 = construir_bloque_voz(
+                "No pude identificar la hora. ¿A qué hora desea la cita?", empresa_id=empresa.id
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -991,9 +994,7 @@ def _continuar_agendado_ia_llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No pude identificar la hora. ¿A qué hora desea la cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -1018,6 +1019,9 @@ def _continuar_agendado_ia_llamada(
             flujo.mensaje = "ESPERANDO_HORA_ACLARACION"
             db.commit()
 
+            voz_1 = construir_bloque_voz(
+                f"¿Se refiere a las {speech} de la mañana o de la tarde?", empresa_id=empresa.id
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -1028,9 +1032,7 @@ def _continuar_agendado_ia_llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Se refiere a las {speech} de la mañana o de la tarde?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -1077,6 +1079,11 @@ def _continuar_agendado_ia_llamada(
                 if respuesta_consulta is not None:
                     return respuesta_consulta
 
+                voz_1 = construir_bloque_voz(
+                    "No entendí la hora. Por favor diga una hora como diez de la mañana, cinco "
+                    "de la tarde o tres y media.",
+                    empresa_id=empresa.id,
+                )
                 twiml = f"""
 <Response>
     <Gather
@@ -1087,9 +1094,7 @@ def _continuar_agendado_ia_llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí la hora. Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -1213,11 +1218,10 @@ async def llamada(
     )
 
     if not empresa:
-        twiml = """
+        voz_1 = construir_bloque_voz("Este número no tiene una empresa configurada.")
+        twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Este número no tiene una empresa configurada.
-    </Say>
+    {voz_1}
 </Response>
 """
         return Response(content=twiml, media_type="application/xml")
@@ -1233,6 +1237,13 @@ async def llamada(
     )
 
     if cita:
+        voz_1, voz_2, voz_3, voz_4 = construir_bloques_voz(
+            f"Hola {cita.nombre}. Encontré una cita agendada para usted en {empresa.nombre}.",
+            f"Su cita es el día {cita.fecha} a las {cita.hora}.",
+            "Diga cancelar o reprogramar.",
+            "No recibí ninguna respuesta. Intente nuevamente.",
+            empresa_id=empresa.id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -1243,25 +1254,23 @@ async def llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Hola {cita.nombre}. Encontré una cita agendada para usted en {empresa.nombre}.
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Su cita es el día {cita.fecha} a las {cita.hora}.
-        </Say>
+        {voz_2}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Diga cancelar o reprogramar.
-        </Say>
+        {voz_3}
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí ninguna respuesta. Intente nuevamente.
-    </Say>
+    {voz_4}
 </Response>
 """
     else:
+        voz_1, voz_2, voz_3 = construir_bloques_voz(
+            f"Hola, bienvenido a {empresa.nombre}.",
+            "No encontré ninguna cita activa.",
+            "Si desea agendar una cita diga agendar.",
+            empresa_id=empresa.id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -1272,17 +1281,11 @@ async def llamada(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Hola, bienvenido a {empresa.nombre}.
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No encontré ninguna cita activa.
-        </Say>
+        {voz_2}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Si desea agendar una cita diga agendar.
-        </Say>
+        {voz_3}
     </Gather>
 </Response>
 """
@@ -1312,12 +1315,11 @@ async def procesar_cita(
     )
 
     if not cita:
+        voz_1 = construir_bloque_voz("No encontré ninguna cita activa.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré ninguna cita activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -1326,12 +1328,14 @@ async def procesar_cita(
     if "cancel" in respuesta:
         cancelar_cita(db, cita)
 
-        twiml = """
+        voz_1 = construir_bloque_voz(
+            "Su cita ha sido cancelada correctamente. Si desea agendar una nueva cita, por "
+            "favor vuelva a llamar.",
+            empresa_id=empresa_id,
+        )
+        twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Su cita ha sido cancelada correctamente.
-        Si desea agendar una nueva cita, por favor vuelva a llamar.
-    </Say>
+    {voz_1}
 </Response>
 """
 
@@ -1362,20 +1366,17 @@ async def procesar_cita(
             db.commit()
 
             if cita.prestador_id:
-                mensaje_opciones = """
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Presione 1 para mantener a su mismo profesional.
-            Presione 2 para elegir otro profesional.
-        </Say>
-"""
+                voz_opciones = construir_bloque_voz(
+                    "Presione 1 para mantener a su mismo profesional. Presione 2 para elegir "
+                    "otro profesional.",
+                    empresa_id=empresa_id,
+                )
             else:
-                mensaje_opciones = """
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Desea atenderse con un profesional específico?
-            Presione 1 para elegir un profesional.
-            Presione 2 para atenderse con cualquier profesional disponible.
-        </Say>
-"""
+                voz_opciones = construir_bloque_voz(
+                    "¿Desea atenderse con un profesional específico? Presione 1 para elegir un "
+                    "profesional. Presione 2 para atenderse con cualquier profesional disponible.",
+                    empresa_id=empresa_id,
+                )
 
             twiml = f"""
 <Response>
@@ -1385,12 +1386,15 @@ async def procesar_cita(
         action="/reprogramar-tipo-prestador?telefono={telefono}"
         method="POST"
         timeout="10">
-{mensaje_opciones}
+        {voz_opciones}
     </Gather>
 </Response>
 """
             return Response(content=twiml, media_type="application/xml")
 
+        voz_1 = construir_bloque_voz(
+            "Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?", empresa_id=empresa_id
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -1401,9 +1405,7 @@ async def procesar_cita(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -1424,12 +1426,11 @@ async def procesar_cita(
     if respuesta_consulta is not None:
         return respuesta_consulta
 
+    voz_1 = construir_bloque_voz("No entendí su respuesta.", empresa_id=empresa_id)
     return Response(
-        content="""
+        content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No entendí su respuesta.
-    </Say>
+    {voz_1}
 </Response>
 """,
         media_type="application/xml",
@@ -1470,14 +1471,16 @@ async def procesar_agenda(
             .all()
         )
 
-        lista_servicios = ""
+        textos_servicios = [f"{i}. {servicio.nombre}" for i, servicio in enumerate(servicios, start=1)]
 
-        for i, servicio in enumerate(servicios, start=1):
-            lista_servicios += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {servicio.nombre}
-            </Say>
-            """
+        voz_intro, voz_instruccion, *bloques_servicios = construir_bloques_voz(
+            "Perfecto. Seleccione uno de los siguientes servicios.",
+            "Presione en su teléfono el número del servicio que desea.",
+            *textos_servicios,
+            empresa_id=empresa_id,
+        )
+
+        lista_servicios = "\n            ".join(bloques_servicios)
 
         twiml = f"""
 <Response>
@@ -1489,16 +1492,11 @@ async def procesar_agenda(
     method="POST"
     timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto.
-            Seleccione uno de los siguientes servicios.
-        </Say>
+        {voz_intro}
 
         {lista_servicios}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-    Presione en su teléfono el número del servicio que desea.
-</Say>
+        {voz_instruccion}
 
     </Gather>
 
@@ -1556,6 +1554,12 @@ async def procesar_agenda(
                 mensaje_usuario=SpeechResult.strip(),
             )
 
+            voz_1, voz_2 = construir_bloques_voz(
+                texto_respuesta,
+                "Si desea agendar una cita, dígalo cuando guste.",
+                empresa_id=empresa_id,
+            )
+
             twiml = f"""
 <Response>
     <Gather
@@ -1566,13 +1570,9 @@ async def procesar_agenda(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            {texto_respuesta}
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Si desea agendar una cita, dígalo cuando guste.
-        </Say>
+        {voz_2}
 
     </Gather>
 </Response>
@@ -1588,11 +1588,10 @@ async def procesar_agenda(
     ):
         return _iniciar_flujo_determinista_servicio()
 
-    twiml = """
+    voz_1 = construir_bloque_voz("No entendí su respuesta.", empresa_id=empresa_id)
+    twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No entendí su respuesta.
-    </Say>
+    {voz_1}
 </Response>
 """
 
@@ -1618,11 +1617,10 @@ async def guardar_nombre(
     print(f"Conversacion encontrada: {conversacion}")
 
     if not conversacion:
-        twiml = """
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
+        twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """
         return Response(content=twiml, media_type="application/xml")
@@ -1646,6 +1644,11 @@ async def guardar_nombre(
 
     db.commit()
 
+    voz_1, voz_2 = construir_bloques_voz(
+        f"Gracias {nombre}. ¿Qué fecha desea para su cita?",
+        "No recibí la fecha. Intente nuevamente.",
+        empresa_id=conversacion.empresa_id,
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -1656,15 +1659,11 @@ async def guardar_nombre(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Gracias {nombre}. ¿Qué fecha desea para su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí la fecha. Intente nuevamente.
-    </Say>
+    {voz_2}
 </Response>
 """
 
@@ -1685,12 +1684,11 @@ async def guardar_servicio(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -1710,14 +1708,15 @@ async def guardar_servicio(
             servicio_seleccionado = servicios[indice]
 
     if not servicio_seleccionado:
-        lista_servicios = ""
+        textos_servicios = [f"{i}. {s.nombre}" for i, s in enumerate(servicios, start=1)]
 
-        for i, servicio in enumerate(servicios, start=1):
-            lista_servicios += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {servicio.nombre}
-            </Say>
-            """
+        voz_error, *bloques_servicios = construir_bloques_voz(
+            "No encontré ese servicio. Por favor presione un número válido.",
+            *textos_servicios,
+            empresa_id=conversacion.empresa_id,
+        )
+
+        lista_servicios = "\n            ".join(bloques_servicios)
 
         twiml = f"""
 <Response>
@@ -1728,7 +1727,7 @@ async def guardar_servicio(
     method="POST"
     timeout="10">
 
-        No encontré ese servicio. Por favor presione un número válido.
+        {voz_error}
 
         {lista_servicios}
 
@@ -1746,6 +1745,12 @@ async def guardar_servicio(
         conversacion.paso = "PEDIR_TIPO_PRESTADOR"
         db.commit()
 
+        voz_1, voz_2 = construir_bloques_voz(
+            f"Perfecto, seleccionó {servicio_seleccionado.nombre}.",
+            "¿Desea atenderse con un profesional específico? Presione 1 para elegir un "
+            "profesional. Presione 2 para atenderse con cualquier profesional disponible.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -1755,15 +1760,9 @@ async def guardar_servicio(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto, seleccionó {servicio_seleccionado.nombre}.
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Desea atenderse con un profesional específico?
-            Presione 1 para elegir un profesional.
-            Presione 2 para atenderse con cualquier profesional disponible.
-        </Say>
+        {voz_2}
 
     </Gather>
 </Response>
@@ -1775,6 +1774,11 @@ async def guardar_servicio(
 
     db.commit()
 
+    voz_1, voz_2 = construir_bloques_voz(
+        f"Perfecto, seleccionó {servicio_seleccionado.nombre}. ¿Cuál es su nombre completo?",
+        "No recibí su nombre. Intente nuevamente.",
+        empresa_id=conversacion.empresa_id,
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -1785,16 +1789,11 @@ async def guardar_servicio(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto, seleccionó {servicio_seleccionado.nombre}.
-            ¿Cuál es su nombre completo?
-        </Say>
+        {voz_1}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí su nombre. Intente nuevamente.
-    </Say>
+    {voz_2}
 </Response>
 """
 
@@ -1814,12 +1813,11 @@ async def guardar_tipo_prestador(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -1833,6 +1831,11 @@ async def guardar_tipo_prestador(
         conversacion.paso = "PEDIR_NOMBRE"
         db.commit()
 
+        voz_1, voz_2 = construir_bloques_voz(
+            "Perfecto, se atenderá con cualquier profesional disponible. ¿Cuál es su nombre completo?",
+            "No recibí su nombre. Intente nuevamente.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -1843,16 +1846,11 @@ async def guardar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto, se atenderá con cualquier profesional disponible.
-            ¿Cuál es su nombre completo?
-        </Say>
+        {voz_1}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí su nombre. Intente nuevamente.
-    </Say>
+    {voz_2}
 </Response>
 """
         return Response(content=twiml, media_type="application/xml")
@@ -1868,6 +1866,12 @@ async def guardar_tipo_prestador(
             conversacion.paso = "PEDIR_NOMBRE"
             db.commit()
 
+            voz_1 = construir_bloque_voz(
+                "Por el momento no hay profesionales específicos disponibles para ese "
+                "servicio. Le atenderá cualquier profesional disponible. ¿Cuál es su nombre "
+                "completo?",
+                empresa_id=conversacion.empresa_id,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -1878,25 +1882,23 @@ async def guardar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Por el momento no hay profesionales específicos disponibles para ese servicio.
-            Le atenderá cualquier profesional disponible.
-            ¿Cuál es su nombre completo?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
 """
             return Response(content=twiml, media_type="application/xml")
 
-        lista_prestadores = ""
+        textos_prestadores = [f"{i}. {p.nombre}" for i, p in enumerate(prestadores, start=1)]
 
-        for i, prestador in enumerate(prestadores, start=1):
-            lista_prestadores += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {prestador.nombre}
-            </Say>
-            """
+        voz_intro, voz_instruccion, *bloques_prestadores = construir_bloques_voz(
+            "Seleccione uno de los siguientes profesionales.",
+            "Presione en su teléfono el número del profesional que desea.",
+            *textos_prestadores,
+            empresa_id=conversacion.empresa_id,
+        )
+
+        lista_prestadores = "\n            ".join(bloques_prestadores)
 
         conversacion.paso = "PEDIR_PRESTADOR"
         db.commit()
@@ -1910,21 +1912,22 @@ async def guardar_tipo_prestador(
     method="POST"
     timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Seleccione uno de los siguientes profesionales.
-        </Say>
+        {voz_intro}
 
         {lista_prestadores}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Presione en su teléfono el número del profesional que desea.
-        </Say>
+        {voz_instruccion}
 
     </Gather>
 </Response>
 """
         return Response(content=twiml, media_type="application/xml")
 
+    voz_1 = construir_bloque_voz(
+        "No entendí su respuesta. Presione 1 para elegir un profesional. Presione 2 para "
+        "atenderse con cualquier profesional disponible.",
+        empresa_id=conversacion.empresa_id,
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -1934,11 +1937,7 @@ async def guardar_tipo_prestador(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí su respuesta.
-            Presione 1 para elegir un profesional.
-            Presione 2 para atenderse con cualquier profesional disponible.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -1959,12 +1958,11 @@ async def guardar_prestador(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -1984,14 +1982,15 @@ async def guardar_prestador(
             prestador_seleccionado = prestadores[indice]
 
     if not prestador_seleccionado:
-        lista_prestadores = ""
+        textos_prestadores = [f"{i}. {p.nombre}" for i, p in enumerate(prestadores, start=1)]
 
-        for i, prestador in enumerate(prestadores, start=1):
-            lista_prestadores += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {prestador.nombre}
-            </Say>
-            """
+        voz_error, *bloques_prestadores = construir_bloques_voz(
+            "No encontré ese profesional. Por favor presione un número válido.",
+            *textos_prestadores,
+            empresa_id=conversacion.empresa_id,
+        )
+
+        lista_prestadores = "\n            ".join(bloques_prestadores)
 
         twiml = f"""
 <Response>
@@ -2002,7 +2001,7 @@ async def guardar_prestador(
     method="POST"
     timeout="10">
 
-        No encontré ese profesional. Por favor presione un número válido.
+        {voz_error}
 
         {lista_prestadores}
 
@@ -2017,6 +2016,11 @@ async def guardar_prestador(
 
     db.commit()
 
+    voz_1, voz_2 = construir_bloques_voz(
+        f"Perfecto, se atenderá con {prestador_seleccionado.nombre}. ¿Cuál es su nombre completo?",
+        "No recibí su nombre. Intente nuevamente.",
+        empresa_id=conversacion.empresa_id,
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -2027,16 +2031,11 @@ async def guardar_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto, se atenderá con {prestador_seleccionado.nombre}.
-            ¿Cuál es su nombre completo?
-        </Say>
+        {voz_1}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí su nombre. Intente nuevamente.
-    </Say>
+    {voz_2}
 </Response>
 """
 
@@ -2052,6 +2051,7 @@ async def guardar_fecha(
     fecha = normalizar_fecha(SpeechResult.strip())
 
     if fecha and fecha_ya_paso(fecha):
+        voz_1 = construir_bloque_voz("La fecha indicada ya pasó. Por favor indique una fecha futura.")
         twiml = f"""
     <Response>
         <Gather
@@ -2060,10 +2060,7 @@ async def guardar_fecha(
             action="/guardar-fecha?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                La fecha indicada ya pasó.
-                Por favor indique una fecha futura.
-            </Say>
+            {voz_1}
 
         </Gather>
     </Response>
@@ -2114,6 +2111,11 @@ async def guardar_fecha(
             if respuesta_consulta is not None:
                 return respuesta_consulta
 
+            voz_1 = construir_bloque_voz(
+                "No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o "
+                "pasado mañana.",
+                empresa_id=empresa_para_ia.id if empresa_para_ia else None,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -2124,9 +2126,7 @@ async def guardar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -2142,12 +2142,11 @@ async def guardar_fecha(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -2162,6 +2161,12 @@ async def guardar_fecha(
 
         db.commit()
 
+        voz_1 = construir_bloque_voz(
+            "Puede elegir una hora específica o indicar que no tiene preferencia de horario. "
+            "Presione 1 para elegir una hora específica. Presione 2 para agendar sin hora "
+            "específica.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -2171,11 +2176,7 @@ async def guardar_fecha(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Puede elegir una hora específica o indicar que no tiene preferencia de horario.
-            Presione 1 para elegir una hora específica.
-            Presione 2 para agendar sin hora específica.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -2187,6 +2188,7 @@ async def guardar_fecha(
 
     db.commit()
 
+    voz_1 = construir_bloque_voz("Perfecto. ¿A qué hora desea la cita?", empresa_id=conversacion.empresa_id)
     twiml = f"""
 <Response>
     <Gather
@@ -2197,9 +2199,7 @@ async def guardar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto. ¿A qué hora desea la cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -2221,12 +2221,11 @@ async def guardar_tipo_hora(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -2252,27 +2251,33 @@ async def guardar_tipo_hora(
                 prestador_id=conversacion.prestador_id,
             )
         except ValueError as error:
+            voz_1 = construir_bloque_voz(
+                f"No fue posible registrar su solicitud: {error}.", empresa_id=conversacion.empresa_id
+            )
             return Response(
                 content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No fue posible registrar su solicitud: {error}.
-    </Say>
+    {voz_1}
 </Response>
 """,
                 media_type="application/xml",
             )
 
+        fecha_confirmada = conversacion.fecha
+        empresa_id_conversacion = conversacion.empresa_id
+
         db.delete(conversacion)
         db.commit()
 
+        voz_1 = construir_bloque_voz(
+            f"Perfecto. Registraré su solicitud para el día {fecha_confirmada} sin una hora "
+            "específica. La empresa podrá asignar el horario posteriormente. Gracias por usar "
+            "nuestro sistema de citas.",
+            empresa_id=empresa_id_conversacion,
+        )
         twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Perfecto. Registraré su solicitud para el día {conversacion.fecha} sin una hora específica.
-        La empresa podrá asignar el horario posteriormente.
-        Gracias por usar nuestro sistema de citas.
-    </Say>
+    {voz_1}
 </Response>
 """
 
@@ -2282,6 +2287,7 @@ async def guardar_tipo_hora(
         conversacion.paso = "PEDIR_HORA"
         db.commit()
 
+        voz_1 = construir_bloque_voz("Perfecto. ¿A qué hora desea la cita?", empresa_id=conversacion.empresa_id)
         twiml = f"""
 <Response>
     <Gather
@@ -2292,9 +2298,7 @@ async def guardar_tipo_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto. ¿A qué hora desea la cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -2302,6 +2306,11 @@ async def guardar_tipo_hora(
 
         return Response(content=twiml, media_type="application/xml")
 
+    voz_1 = construir_bloque_voz(
+        "No entendí su respuesta. Presione 1 para elegir una hora específica. Presione 2 "
+        "para agendar sin hora específica.",
+        empresa_id=conversacion.empresa_id,
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -2311,11 +2320,7 @@ async def guardar_tipo_hora(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí su respuesta.
-            Presione 1 para elegir una hora específica.
-            Presione 2 para agendar sin hora específica.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -2335,12 +2340,11 @@ async def agendar_ia_continuar(
     flujo = db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
 
     if not flujo:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -2372,12 +2376,11 @@ async def guardar_hora(
         )
 
         if not conversacion:
+            voz_1 = construir_bloque_voz("No encontré una conversación activa.")
             return Response(
-                content="""
+                content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
                 media_type="application/xml",
@@ -2387,6 +2390,11 @@ async def guardar_hora(
         conversacion.paso = "ACLARAR_HORA"
         db.commit()
 
+        voz_1, voz_2 = construir_bloques_voz(
+            f"¿Se refiere a las {SpeechResult} de la mañana o de la tarde?",
+            "No recibí la aclaración. Intente nuevamente.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -2397,15 +2405,11 @@ async def guardar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Se refiere a las {SpeechResult} de la mañana o de la tarde?
-        </Say>
+        {voz_1}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí la aclaración. Intente nuevamente.
-    </Say>
+    {voz_2}
 </Response>
 """
 
@@ -2468,6 +2472,12 @@ async def guardar_hora(
             if respuesta_consulta is not None:
                 return respuesta_consulta
 
+            voz_1, voz_2, voz_3 = construir_bloques_voz(
+                "No entendí la hora.",
+                "Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.",
+                "No recibí ninguna respuesta. Intente nuevamente.",
+                empresa_id=empresa_para_ia.id if empresa_para_ia else None,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -2478,19 +2488,13 @@ async def guardar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí la hora.
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
-        </Say>
+        {voz_2}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí ninguna respuesta. Intente nuevamente.
-    </Say>
+    {voz_3}
 </Response>
 """
 
@@ -2503,18 +2507,20 @@ async def guardar_hora(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
         )
 
     if hora_ya_paso(conversacion.fecha, hora):
+        voz_1 = construir_bloque_voz(
+            "Esa hora ya pasó. Por favor indique una hora futura.", empresa_id=conversacion.empresa_id
+        )
         twiml = f"""
     <Response>
         <Gather
@@ -2523,10 +2529,7 @@ async def guardar_hora(
             action="/guardar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Esa hora ya pasó.
-                Por favor indique una hora futura.
-            </Say>
+            {voz_1}
 
         </Gather>
     </Response>
@@ -2545,6 +2548,12 @@ async def guardar_hora(
     empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
 
     if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+        voz_1, voz_2 = construir_bloques_voz(
+            f"Lo sentimos. El horario de atención es de {empresa.horario_inicio} a "
+            f"{empresa.horario_fin}. Por favor indique otra hora.",
+            "No recibí la hora. Intente nuevamente.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
     <Response>
         <Gather
@@ -2555,22 +2564,16 @@ async def guardar_hora(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Lo sentimos.
-                El horario de atención es de {empresa.horario_inicio} a {empresa.horario_fin}.
-                Por favor indique otra hora.
-            </Say>
+            {voz_1}
 
         </Gather>
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No recibí la hora. Intente nuevamente.
-        </Say>
+        {voz_2}
     </Response>
     """
 
         return Response(content=twiml, media_type="application/xml")
-    
+
     prestador_final = None
 
     if empresa.usa_prestadores:
@@ -2626,6 +2629,10 @@ async def guardar_hora(
         if cita_ocupada:
             return respuesta_horario_ocupado()
 
+    nombre_cliente = conversacion.nombre
+    fecha_cita = conversacion.fecha
+    empresa_id_conversacion = conversacion.empresa_id
+
     nueva_cita = Cita(
         nombre=conversacion.nombre,
         telefono=telefono,
@@ -2641,14 +2648,14 @@ async def guardar_hora(
     db.delete(conversacion)
     db.commit()
 
+    voz_1 = construir_bloque_voz(
+        f"Perfecto {nombre_cliente}. Su cita fue agendada para el día {fecha_cita} a las "
+        f"{hora} horas. Gracias por usar nuestro sistema de citas.",
+        empresa_id=empresa_id_conversacion,
+    )
     twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Perfecto {conversacion.nombre}.
-        Su cita fue agendada para el día {conversacion.fecha}
-        a las {hora} horas.
-        Gracias por usar nuestro sistema de citas.
-    </Say>
+    {voz_1}
 </Response>
 """
 
@@ -2668,12 +2675,11 @@ async def aclarar_hora(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -2703,12 +2709,11 @@ async def aclarar_hora(
     try:
         numero = int("".join(filter(str.isdigit, hora_original)))
     except:
+        voz_1 = construir_bloque_voz("No pude identificar la hora.", empresa_id=conversacion.empresa_id)
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No pude identificar la hora.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -2720,6 +2725,9 @@ async def aclarar_hora(
         hora_final = f"{numero:02d}:00"
 
     if hora_ya_paso(conversacion.fecha, hora_final):
+        voz_1 = construir_bloque_voz(
+            "Esa hora ya pasó. Por favor indique una hora futura.", empresa_id=conversacion.empresa_id
+        )
         twiml = f"""
     <Response>
         <Gather
@@ -2728,19 +2736,22 @@ async def aclarar_hora(
             action="/guardar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Esa hora ya pasó.
-                Por favor indique una hora futura.
-            </Say>
+            {voz_1}
 
         </Gather>
     </Response>
     """
         return Response(content=twiml, media_type="application/xml")
-    
+
     empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
 
     if hora_final < empresa.horario_inicio or hora_final > empresa.horario_fin:
+        voz_1, voz_2 = construir_bloques_voz(
+            f"Lo sentimos. Nuestro horario de atención es de {empresa.horario_inicio} a "
+            f"{empresa.horario_fin}. Por favor indique otra hora.",
+            "No recibí ninguna respuesta.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
     <Response>
 
@@ -2752,24 +2763,16 @@ async def aclarar_hora(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Lo sentimos.
-                Nuestro horario de atención es de
-                {empresa.horario_inicio}
-                a
-                {empresa.horario_fin}.
-                Por favor indique otra hora.
-            </Say>
+            {voz_1}
 
         </Gather>
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No recibí ninguna respuesta.
-        </Say>
+        {voz_2}
 
     </Response>
     """
         return Response(content=twiml, media_type="application/xml")
+
     prestador_final = None
 
     if empresa.usa_prestadores:
@@ -2825,6 +2828,8 @@ async def aclarar_hora(
         if cita_ocupada:
             return respuesta_horario_ocupado()
 
+    empresa_id_conversacion = conversacion.empresa_id
+
     nueva_cita = Cita(
         nombre=conversacion.nombre,
         telefono=telefono,
@@ -2842,15 +2847,14 @@ async def aclarar_hora(
 
     db.commit()
 
+    voz_1 = construir_bloque_voz(
+        f"Perfecto. Su cita fue agendada para el día {nueva_cita.fecha} a las "
+        f"{hora_final} horas.",
+        empresa_id=empresa_id_conversacion,
+    )
     twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Perfecto.
-        Su cita fue agendada para el día
-        {nueva_cita.fecha}
-        a las
-        {hora_final} horas.
-    </Say>
+    {voz_1}
 </Response>
 """
 
@@ -2866,6 +2870,7 @@ async def reprogramar_fecha(
     fecha = normalizar_fecha(SpeechResult.strip())
 
     if fecha and fecha_ya_paso(fecha):
+        voz_1 = construir_bloque_voz("La fecha indicada ya pasó. Por favor indique una fecha futura.")
         twiml = f"""
     <Response>
         <Gather
@@ -2874,16 +2879,12 @@ async def reprogramar_fecha(
             action="/reprogramar-fecha?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                La fecha indicada ya pasó.
-                Por favor indique una fecha futura.
-            </Say>
+            {voz_1}
 
         </Gather>
     </Response>
     """
         return Response(content=twiml, media_type="application/xml")
-
 
     if fecha is None:
         conversacion_para_ia = (
@@ -2907,6 +2908,11 @@ async def reprogramar_fecha(
         if respuesta_consulta is not None:
             return respuesta_consulta
 
+        voz_1 = construir_bloque_voz(
+            "No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o "
+            "pasado mañana.",
+            empresa_id=empresa_para_ia.id if empresa_para_ia else None,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -2917,9 +2923,7 @@ async def reprogramar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí la fecha. Por favor diga una fecha como quince de junio, mañana o pasado mañana.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -2932,12 +2936,11 @@ async def reprogramar_fecha(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -2948,6 +2951,11 @@ async def reprogramar_fecha(
 
     db.commit()
 
+    voz_1, voz_2 = construir_bloques_voz(
+        "Perfecto. ¿A qué nueva hora desea reprogramar su cita?",
+        "No recibí la hora. Intente nuevamente.",
+        empresa_id=conversacion.empresa_id,
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -2958,15 +2966,11 @@ async def reprogramar_fecha(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto. ¿A qué nueva hora desea reprogramar su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí la hora. Intente nuevamente.
-    </Say>
+    {voz_2}
 </Response>
 """
 
@@ -2986,12 +2990,11 @@ async def reprogramar_tipo_prestador(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -3004,6 +3007,9 @@ async def reprogramar_tipo_prestador(
         conversacion.paso = "REPROGRAMAR_FECHA"
         db.commit()
 
+        voz_1 = construir_bloque_voz(
+            "Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?", empresa_id=conversacion.empresa_id
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -3014,9 +3020,7 @@ async def reprogramar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto. ¿Para qué nueva fecha desea reprogramar su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -3029,6 +3033,11 @@ async def reprogramar_tipo_prestador(
         conversacion.paso = "REPROGRAMAR_FECHA"
         db.commit()
 
+        voz_1 = construir_bloque_voz(
+            "Perfecto, se atenderá con cualquier profesional disponible. ¿Para qué nueva fecha "
+            "desea reprogramar su cita?",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -3039,10 +3048,7 @@ async def reprogramar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto, se atenderá con cualquier profesional disponible.
-            ¿Para qué nueva fecha desea reprogramar su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -3062,6 +3068,12 @@ async def reprogramar_tipo_prestador(
             conversacion.paso = "REPROGRAMAR_FECHA"
             db.commit()
 
+            voz_1 = construir_bloque_voz(
+                "Por el momento no hay profesionales específicos disponibles para ese "
+                "servicio. Le atenderá cualquier profesional disponible. ¿Para qué nueva fecha "
+                "desea reprogramar su cita?",
+                empresa_id=conversacion.empresa_id,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -3072,25 +3084,23 @@ async def reprogramar_tipo_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Por el momento no hay profesionales específicos disponibles para ese servicio.
-            Le atenderá cualquier profesional disponible.
-            ¿Para qué nueva fecha desea reprogramar su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
 """
             return Response(content=twiml, media_type="application/xml")
 
-        lista_prestadores = ""
+        textos_prestadores = [f"{i}. {p.nombre}" for i, p in enumerate(prestadores, start=1)]
 
-        for i, prestador in enumerate(prestadores, start=1):
-            lista_prestadores += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {prestador.nombre}
-            </Say>
-            """
+        voz_intro, voz_instruccion, *bloques_prestadores = construir_bloques_voz(
+            "Seleccione uno de los siguientes profesionales.",
+            "Presione en su teléfono el número del profesional que desea.",
+            *textos_prestadores,
+            empresa_id=conversacion.empresa_id,
+        )
+
+        lista_prestadores = "\n            ".join(bloques_prestadores)
 
         conversacion.paso = "REPROGRAMAR_PRESTADOR"
         db.commit()
@@ -3104,21 +3114,20 @@ async def reprogramar_tipo_prestador(
     method="POST"
     timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Seleccione uno de los siguientes profesionales.
-        </Say>
+        {voz_intro}
 
         {lista_prestadores}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Presione en su teléfono el número del profesional que desea.
-        </Say>
+        {voz_instruccion}
 
     </Gather>
 </Response>
 """
         return Response(content=twiml, media_type="application/xml")
 
+    voz_1 = construir_bloque_voz(
+        "No entendí su respuesta. Presione 1 o presione 2.", empresa_id=conversacion.empresa_id
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -3128,9 +3137,7 @@ async def reprogramar_tipo_prestador(
         method="POST"
         timeout="10">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí su respuesta. Presione 1 o presione 2.
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -3151,12 +3158,11 @@ async def reprogramar_prestador(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa. Intente llamar nuevamente.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa. Intente llamar nuevamente.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -3176,14 +3182,15 @@ async def reprogramar_prestador(
             prestador_seleccionado = prestadores[indice]
 
     if not prestador_seleccionado:
-        lista_prestadores = ""
+        textos_prestadores = [f"{i}. {p.nombre}" for i, p in enumerate(prestadores, start=1)]
 
-        for i, prestador in enumerate(prestadores, start=1):
-            lista_prestadores += f"""
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                {i}. {prestador.nombre}
-            </Say>
-            """
+        voz_error, *bloques_prestadores = construir_bloques_voz(
+            "No encontré ese profesional. Por favor presione un número válido.",
+            *textos_prestadores,
+            empresa_id=conversacion.empresa_id,
+        )
+
+        lista_prestadores = "\n            ".join(bloques_prestadores)
 
         twiml = f"""
 <Response>
@@ -3194,7 +3201,7 @@ async def reprogramar_prestador(
     method="POST"
     timeout="10">
 
-        No encontré ese profesional. Por favor presione un número válido.
+        {voz_error}
 
         {lista_prestadores}
 
@@ -3209,6 +3216,11 @@ async def reprogramar_prestador(
 
     db.commit()
 
+    voz_1 = construir_bloque_voz(
+        f"Perfecto, se atenderá con {prestador_seleccionado.nombre}. ¿Para qué nueva fecha "
+        "desea reprogramar su cita?",
+        empresa_id=conversacion.empresa_id,
+    )
     twiml = f"""
 <Response>
     <Gather
@@ -3219,10 +3231,7 @@ async def reprogramar_prestador(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Perfecto, se atenderá con {prestador_seleccionado.nombre}.
-            ¿Para qué nueva fecha desea reprogramar su cita?
-        </Say>
+        {voz_1}
 
     </Gather>
 </Response>
@@ -3248,12 +3257,11 @@ async def reprogramar_hora(
         )
 
         if not conversacion:
+            voz_1 = construir_bloque_voz("No encontré una conversación activa.")
             return Response(
-                content="""
+                content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
                 media_type="application/xml",
@@ -3263,6 +3271,11 @@ async def reprogramar_hora(
         conversacion.paso = "ACLARAR_HORA_REPROGRAMAR"
         db.commit()
 
+        voz_1, voz_2 = construir_bloques_voz(
+            f"¿Se refiere a las {SpeechResult} de la mañana o de la tarde?",
+            "No recibí la aclaración. Intente nuevamente.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
 <Response>
     <Gather
@@ -3273,15 +3286,11 @@ async def reprogramar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            ¿Se refiere a las {SpeechResult} de la mañana o de la tarde?
-        </Say>
+        {voz_1}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí la aclaración. Intente nuevamente.
-    </Say>
+    {voz_2}
 </Response>
 """
 
@@ -3343,6 +3352,12 @@ async def reprogramar_hora(
             if respuesta_consulta is not None:
                 return respuesta_consulta
 
+            voz_1, voz_2, voz_3 = construir_bloques_voz(
+                "No entendí la hora.",
+                "Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.",
+                "No recibí ninguna respuesta. Intente nuevamente.",
+                empresa_id=empresa_para_ia.id if empresa_para_ia else None,
+            )
             twiml = f"""
 <Response>
     <Gather
@@ -3353,19 +3368,13 @@ async def reprogramar_hora(
         timeout="8"
         speechTimeout="auto">
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No entendí la hora.
-        </Say>
+        {voz_1}
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            Por favor diga una hora como diez de la mañana, cinco de la tarde o tres y media.
-        </Say>
+        {voz_2}
 
     </Gather>
 
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No recibí ninguna respuesta. Intente nuevamente.
-    </Say>
+    {voz_3}
 </Response>
 """
 
@@ -3375,18 +3384,20 @@ async def reprogramar_hora(
         db.query(Conversacion).filter(Conversacion.telefono == telefono).first()
     )
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa.")
         return Response(
-            content="""
+            content=f"""
     <Response>
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No encontré una conversación activa.
-        </Say>
+        {voz_1}
     </Response>
     """,
             media_type="application/xml",
         )
 
     if hora_ya_paso(conversacion.fecha, hora):
+        voz_1 = construir_bloque_voz(
+            "Esa hora ya pasó. Por favor indique una hora futura.", empresa_id=conversacion.empresa_id
+        )
         twiml = f"""
     <Response>
         <Gather
@@ -3395,10 +3406,7 @@ async def reprogramar_hora(
             action="/reprogramar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Esa hora ya pasó.
-                Por favor indique una hora futura.
-            </Say>
+            {voz_1}
 
         </Gather>
     </Response>
@@ -3414,12 +3422,13 @@ async def reprogramar_hora(
     )
 
     if not cita_anterior:
+        voz_1 = construir_bloque_voz(
+            "No encontré una cita activa para reprogramar.", empresa_id=conversacion.empresa_id
+        )
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una cita activa para reprogramar.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -3428,6 +3437,12 @@ async def reprogramar_hora(
     empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
 
     if hora < empresa.horario_inicio or hora > empresa.horario_fin:
+        voz_1, voz_2 = construir_bloques_voz(
+            f"Lo sentimos. Nuestro horario de atención es de {empresa.horario_inicio} a "
+            f"{empresa.horario_fin}. Por favor indique otra hora.",
+            "No recibí ninguna respuesta.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
     <Response>
 
@@ -3439,25 +3454,16 @@ async def reprogramar_hora(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Lo sentimos.
-                Nuestro horario de atención es de
-                {empresa.horario_inicio}
-                a
-                {empresa.horario_fin}.
-                Por favor indique otra hora.
-            </Say>
+            {voz_1}
 
         </Gather>
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No recibí ninguna respuesta.
-        </Say>
+        {voz_2}
 
     </Response>
     """
         return Response(content=twiml, media_type="application/xml")
-    
+
     prestador_final = conversacion.prestador_id
 
     if empresa.usa_prestadores and conversacion.asignacion_automatica:
@@ -3506,6 +3512,8 @@ async def reprogramar_hora(
 
             return respuesta_horario_ocupado()
 
+    empresa_id_conversacion = conversacion.empresa_id
+
     nueva_cita = reprogramar_cita(
         db=db,
         cita_anterior=cita_anterior,
@@ -3518,14 +3526,14 @@ async def reprogramar_hora(
     db.delete(conversacion)
     db.commit()
 
+    voz_1 = construir_bloque_voz(
+        f"Su cita fue reprogramada correctamente para el día {nueva_cita.fecha} a las "
+        f"{nueva_cita.hora} horas.",
+        empresa_id=empresa_id_conversacion,
+    )
     twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Su cita fue reprogramada correctamente para el día
-        {nueva_cita.fecha}
-        a las
-        {nueva_cita.hora} horas.
-    </Say>
+    {voz_1}
 </Response>
 """
 
@@ -3545,12 +3553,11 @@ async def aclarar_hora_reprogramar(
     )
 
     if not conversacion:
+        voz_1 = construir_bloque_voz("No encontré una conversación activa.")
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una conversación activa.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -3580,12 +3587,11 @@ async def aclarar_hora_reprogramar(
     try:
         numero = int("".join(filter(str.isdigit, hora_original)))
     except:
+        voz_1 = construir_bloque_voz("No pude identificar la hora.", empresa_id=conversacion.empresa_id)
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No pude identificar la hora.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -3597,6 +3603,9 @@ async def aclarar_hora_reprogramar(
         hora_final = f"{numero:02d}:00"
 
     if hora_ya_paso(conversacion.fecha, hora_final):
+        voz_1 = construir_bloque_voz(
+            "Esa hora ya pasó. Por favor indique una hora futura.", empresa_id=conversacion.empresa_id
+        )
         twiml = f"""
     <Response>
         <Gather
@@ -3605,10 +3614,7 @@ async def aclarar_hora_reprogramar(
             action="/reprogramar-hora?telefono={telefono}"
             method="POST">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Esa hora ya pasó.
-                Por favor indique una hora futura.
-            </Say>
+            {voz_1}
 
         </Gather>
     </Response>
@@ -3624,12 +3630,13 @@ async def aclarar_hora_reprogramar(
     )
 
     if not cita_anterior:
+        voz_1 = construir_bloque_voz(
+            "No encontré una cita activa para reprogramar.", empresa_id=conversacion.empresa_id
+        )
         return Response(
-            content="""
+            content=f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        No encontré una cita activa para reprogramar.
-    </Say>
+    {voz_1}
 </Response>
 """,
             media_type="application/xml",
@@ -3638,6 +3645,12 @@ async def aclarar_hora_reprogramar(
     empresa = db.query(Empresa).filter(Empresa.id == conversacion.empresa_id).first()
 
     if hora_final < empresa.horario_inicio or hora_final > empresa.horario_fin:
+        voz_1, voz_2 = construir_bloques_voz(
+            f"Lo sentimos. Nuestro horario de atención es de {empresa.horario_inicio} a "
+            f"{empresa.horario_fin}. Por favor indique otra hora.",
+            "No recibí ninguna respuesta.",
+            empresa_id=conversacion.empresa_id,
+        )
         twiml = f"""
     <Response>
 
@@ -3649,24 +3662,16 @@ async def aclarar_hora_reprogramar(
             timeout="8"
             speechTimeout="auto">
 
-            <Say language="es-MX" voice="Polly.Mia-Neural">
-                Lo sentimos.
-                Nuestro horario de atención es de
-                {empresa.horario_inicio}
-                a
-                {empresa.horario_fin}.
-                Por favor indique otra hora.
-            </Say>
+            {voz_1}
 
         </Gather>
 
-        <Say language="es-MX" voice="Polly.Mia-Neural">
-            No recibí ninguna respuesta.
-        </Say>
+        {voz_2}
 
     </Response>
     """
         return Response(content=twiml, media_type="application/xml")
+
     prestador_final = conversacion.prestador_id
 
     if empresa.usa_prestadores and conversacion.asignacion_automatica:
@@ -3715,6 +3720,8 @@ async def aclarar_hora_reprogramar(
 
             return respuesta_horario_ocupado()
 
+    empresa_id_conversacion = conversacion.empresa_id
+
     nueva_cita = reprogramar_cita(
         db=db,
         cita_anterior=cita_anterior,
@@ -3725,14 +3732,15 @@ async def aclarar_hora_reprogramar(
     )
     db.delete(conversacion)
     db.commit()
+
+    voz_1 = construir_bloque_voz(
+        f"Su cita fue reprogramada correctamente para el día {nueva_cita.fecha} a las "
+        f"{hora_final} horas.",
+        empresa_id=empresa_id_conversacion,
+    )
     twiml = f"""
 <Response>
-    <Say language="es-MX" voice="Polly.Mia-Neural">
-        Su cita fue reprogramada correctamente para el día
-        {nueva_cita.fecha}
-        a las
-        {hora_final} horas.
-    </Say>
+    {voz_1}
 </Response>
 """
 

@@ -17,3 +17,6 @@ citas.db
 
 # Archivos temporales
 *.log
+
+# Audios temporales generados por ElevenLabs
+app/static/audio/
